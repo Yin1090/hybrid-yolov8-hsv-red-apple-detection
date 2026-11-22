@@ -90,6 +90,7 @@ def restore_specular_glare_holes(mask: np.ndarray, roi_bgr: np.ndarray) -> np.nd
     h, w = mask.shape[:2]
     out = mask.copy()
     k_ext = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+    k_rim = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
     pad = 8
 
     for cnt in contours:
@@ -123,6 +124,12 @@ def restore_specular_glare_holes(mask: np.ndarray, roi_bgr: np.ndarray) -> np.nd
         sub_hsv = cv2.cvtColor(sub_bgr, cv2.COLOR_BGR2HSV)
         fg_s_med = float(np.median(sub_hsv[..., 1][fg_pixels]))
         fg_v_med = float(np.median(sub_hsv[..., 2][fg_pixels]))
+        hull_area = float(cv2.contourArea(cv2.convexHull(cnt)))
+        fg_solidity = (float(np.count_nonzero(fg_pixels)) / hull_area) if hull_area > 0.0 else 0.0
+        outer_rim = (cv2.dilate((cnt_fill == 0).astype(np.uint8) * 255, k_rim) > 0) & fg_pixels
+        outer_rim_v = (
+            float(np.median(sub_hsv[..., 2][outer_rim])) if np.any(outer_rim) else fg_v_med
+        )
 
         ext_collar = (cv2.dilate(cnt_fill, k_ext) > 0) & (cnt_fill == 0) & (sub_mask == 0)
         has_ext = bool(np.any(ext_collar))
@@ -145,10 +152,22 @@ def restore_specular_glare_holes(mask: np.ndarray, roi_bgr: np.ndarray) -> np.nd
             h_v = float(np.median(sub_hsv[..., 2][hm]))
             if h_s > s_thresh or h_v < v_thresh:
                 continue
-            if has_ext and ext_bgr_med is not None and (h_ratio >= 0.10 or h_area >= 1000.0):
+            if has_ext and ext_bgr_med is not None:
                 h_bgr_med = np.median(sub_bgr[hm].astype(np.float32), axis=0)
                 if float(np.linalg.norm(h_bgr_med - ext_bgr_med)) < 28.0:
-                    continue
+                    # Background-matched hole: allow only inside high-solidity 3D-shaded
+                    # apples whose inner collar exhibits a bright specular halo.
+                    if fg_solidity >= 0.92 and h_ratio < 0.10:
+                        inner_rim = (cv2.dilate(hm.astype(np.uint8) * 255, k_rim) > 0) & fg_pixels
+                        in_v = (
+                            float(np.median(sub_hsv[..., 2][inner_rim]))
+                            if np.any(inner_rim)
+                            else fg_v_med
+                        )
+                        if (in_v - fg_v_med) < 15.0 or (in_v - outer_rim_v) < 25.0:
+                            continue
+                    else:
+                        continue
             sub_out[hm] = 255
 
     return out
@@ -285,30 +304,60 @@ def is_annular_or_ribbon_void(
     hull_area = float(cv2.contourArea(cv2.convexHull(cnt)))
     fg_solidity = (fg_area / hull_area) if hull_area > 0.0 else 0.0
     hole_ratio = 1.0 - (fg_area / outer_area)
-    if fg_solidity >= 0.78 and hole_ratio < 0.025:
-        return False
 
     dist = _padded_distance_transform(sub_fg)
     max_dt = float(dist.max())
     (_, _), (mw, mh), _ = cv2.minAreaRect(cnt)
     minor_span = max(min(float(mw) + 1.0, float(mh) + 1.0), 1.0)
+    major_span = max(max(float(mw) + 1.0, float(mh) + 1.0), 1.0)
     thick_ratio = (2.0 * max_dt) / minor_span
+    aspect_ratio = major_span / minor_span
+    maj_dt_ratio = major_span / max(2.0 * max_dt, 1.0)
     if (hole_ratio >= 0.06 and thick_ratio < 0.45) or (hole_ratio >= 0.15 and thick_ratio < 0.52):
         return True
 
     max_defect = 0.0
+    second_defect = 0.0
+    top1_span = 0.0
     hull_idx = cv2.convexHull(cnt, returnPoints=False)
     if hull_idx is not None and len(hull_idx) > 3 and len(cnt) > 3:
         try:
             defects = cv2.convexityDefects(cnt, hull_idx)
             if defects is not None and defects.size > 0:
-                max_defect = float(np.max(defects.reshape(-1, 4)[:, 3]) / 256.0)
+                d_rows: list[tuple[float, float]] = []
+                for s_idx, e_idx, _, d_q8 in defects.reshape(-1, 4):
+                    d_val = float(d_q8) / 256.0
+                    sx, sy = int(cnt[s_idx][0][0]), int(cnt[s_idx][0][1])
+                    ex, ey = int(cnt[e_idx][0][0]), int(cnt[e_idx][0][1])
+                    d_rows.append((d_val, math.hypot(ex - sx, ey - sy)))
+                d_rows.sort(key=lambda item: item[0], reverse=True)
+                max_defect, top1_span = d_rows[0]
+                if len(d_rows) > 1:
+                    second_defect = d_rows[1][0]
         except cv2.error:
             max_defect = 0.0
     defect_ratio = max_defect / minor_span
-    if fg_solidity >= 0.85 and hole_ratio < 0.06 and defect_ratio >= 0.06:
+    second_defect_ratio = second_defect / minor_span
+    top1_span_ratio = top1_span / major_span
+
+    if (
+        fg_solidity >= 0.85
+        and hole_ratio < 0.06
+        and 0.06 <= defect_ratio <= 0.25
+        and second_defect_ratio >= 0.045
+    ):
         return False
-    return (thick_ratio < 0.48) or (defect_ratio > 0.46 and thick_ratio < 0.55)
+
+    is_curved_ribbon = (
+        hole_ratio < 0.025
+        and thick_ratio < 0.78
+        and aspect_ratio >= 1.95
+        and maj_dt_ratio >= 2.75
+        and defect_ratio >= 0.25
+        and top1_span_ratio >= 0.62
+        and second_defect_ratio <= 0.045
+    )
+    return is_curved_ribbon or (thick_ratio < 0.48) or (defect_ratio > 0.46 and thick_ratio < 0.55)
 
 
 def _is_valid_two_apple_split(
@@ -319,6 +368,7 @@ def _is_valid_two_apple_split(
     major: float,
     thick_ratio: float,
     max_dt: float,
+    peak_centers: list[tuple[int, int]] | None = None,
 ) -> bool:
     """Validate that a 2-part split matches two overlapping disks rather than one occluded ellipse."""
     if len(parts) != 2:
@@ -326,9 +376,12 @@ def _is_valid_two_apple_split(
 
     fg_bool = sub_fg > 0
     u_mask = np.zeros_like(sub_fg)
-    for part in parts:
-        masked_dist = np.where(part > 0, dist, -1.0)
-        py, px = np.unravel_index(int(np.argmax(masked_dist)), dist.shape)
+    for idx, part in enumerate(parts):
+        if peak_centers is not None and idx < len(peak_centers):
+            px, py = peak_centers[idx]
+        else:
+            masked_dist = np.where(part > 0, dist, -1.0)
+            py, px = np.unravel_index(int(np.argmax(masked_dist)), dist.shape)
         rad = max(1, int(round(float(dist[py, px]))))
         cv2.circle(u_mask, (int(px), int(py)), rad, 255, -1)
 
@@ -337,7 +390,7 @@ def _is_valid_two_apple_split(
     if union_px <= 0:
         return False
     two_c_iou = float(np.count_nonzero(fg_bool & u_bool)) / float(union_px)
-    if two_c_iou >= 0.932:
+    if two_c_iou >= 0.945:
         return True
     if two_c_iou < 0.895 or thick_ratio < 0.925:
         return False
@@ -617,12 +670,22 @@ def extract_blob_components(
                     )
                     for grp in unique_roots
                 ]
+                grp_radii = [
+                    max(
+                        float(dist[pk_coords[kept_indices[u]][1], pk_coords[kept_indices[u]][0]])
+                        for u in range(m_k)
+                        if roots[u] == grp
+                    )
+                    for grp in unique_roots
+                ]
                 grp_arr = np.asarray(grp_centers, dtype=np.float64)
+                grp_r2 = np.asarray([r * r for r in grp_radii], dtype=np.float64)
                 ys, xs = np.where(sub_fg > 0)
                 pts = np.stack([xs, ys], axis=1)
-                d2 = ((pts[:, None, :] - grp_arr[None, :, :]) ** 2).sum(axis=2)
+                d2 = ((pts[:, None, :] - grp_arr[None, :, :]) ** 2).sum(axis=2) - grp_r2[None, :]
                 nearest = np.argmin(d2, axis=1)
                 parts: list[np.ndarray] = []
+                part_centers: list[tuple[int, int]] = []
                 for gi in range(len(unique_roots)):
                     sel = nearest == gi
                     if int(np.count_nonzero(sel)) < min_area:
@@ -630,10 +693,23 @@ def extract_blob_components(
                     part = np.zeros_like(sub_fg)
                     part[ys[sel], xs[sel]] = 255
                     parts.append(part)
+                    part_centers.append(
+                        (
+                            int(np.clip(round(float(grp_centers[gi][0])), 0, cw - 1)),
+                            int(np.clip(round(float(grp_centers[gi][1])), 0, ch - 1)),
+                        )
+                    )
                 if len(parts) == 2 and (
                     thick_ratio < 0.925
                     or not _is_valid_two_apple_split(
-                        sub_fg, dist, cnt, parts, major, thick_ratio, max_dt
+                        sub_fg,
+                        dist,
+                        cnt,
+                        parts,
+                        major,
+                        thick_ratio,
+                        max_dt,
+                        peak_centers=part_centers,
                     )
                 ):
                     parts = []

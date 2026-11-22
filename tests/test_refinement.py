@@ -506,3 +506,89 @@ def test_offcenter_ellipses_and_tight_occluded_clusters_refinement() -> None:
     assert len(detect_in_rect(im_4d, config=cfg)[0]) == 4
 
 
+def test_iteration7_power_voronoi_glare_halo_and_void_regression() -> None:
+    import math
+
+    cfg = PipelineConfig()
+
+    # 1. Clean binary Unequal(16, 38, d=48/49) split via Power-Voronoi + peak_centers
+    for d in (48, 49):
+        for ang_deg in (0, 17, 90):
+            bin_mask = np.zeros((160, 160), dtype=np.uint8)
+            dx = int(round(d * math.cos(math.radians(ang_deg))))
+            dy = int(round(d * math.sin(math.radians(ang_deg))))
+            cv2.circle(bin_mask, (55, 60), 16, 255, -1)
+            cv2.circle(bin_mask, (55 + dx, 60 + dy), 38, 255, -1)
+            ys, xs = np.where(bin_mask > 0)
+            crop = bin_mask[ys.min() : ys.max() + 1, xs.min() : xs.max() + 1]
+            parts = extract_blob_components(crop, min_area=120)
+            assert len(parts) == 2, f"Unequal(16,38,d={d},ang={ang_deg}) returned {len(parts)} parts"
+
+    # 2. Pinhole rings Ring_r40_t52, Ring_r45_t58, Ring_r50_t62 rejected & un-restored on white bg
+    for r, t in [(40, 52), (45, 58), (50, 62)]:
+        im_w = np.full((320, 320, 3), (245, 245, 245), dtype=np.uint8)
+        cv2.circle(im_w, (160, 160), r, (18, 20, 205), thickness=t)
+        m_ring = np.zeros((320, 320), dtype=np.uint8)
+        cv2.circle(m_ring, (160, 160), r, 255, thickness=t)
+        restored_ring = restore_specular_glare_holes(m_ring, im_w)
+        assert int(restored_ring[160, 160]) == 0
+        assert is_annular_or_ribbon_void(m_ring) is True
+
+    # 3. ThickC_60_58_g70, ThickC_70_68_g80, Kidney_80_32, Kidney_80_38 rejected & unsplit
+    void_masks: list[tuple[str, np.ndarray]] = []
+    for name, draw_fn in [
+        ("ThickC_60_58_g70", lambda m: cv2.ellipse(m, (160, 160), (60, 60), 0, 35, 325, 255, thickness=58)),
+        ("ThickC_70_68_g80", lambda m: cv2.ellipse(m, (160, 160), (70, 70), 0, 40, 320, 255, thickness=68)),
+        ("Kidney_80_32", lambda m: cv2.ellipse(m, (160, 190), (80, 80), 0, 210, 330, 255, thickness=32)),
+        ("Kidney_80_38", lambda m: cv2.ellipse(m, (160, 190), (80, 80), 0, 210, 330, 255, thickness=38)),
+    ]:
+        m = np.zeros((320, 320), dtype=np.uint8)
+        draw_fn(m)
+        assert is_annular_or_ribbon_void(m) is True, f"{name} missed void check"
+        assert len(extract_blob_components(m, min_area=120)) == 1, f"{name} shattered"
+        void_masks.append((name, m))
+
+    # 4. AppleShaded_w245_r45_g10 on white background preserves glare-filled single detection
+    im_sh = np.full((320, 320, 3), (245, 245, 245), dtype=np.uint8)
+    yy, xx = np.ogrid[:320, :320]
+    dx = (xx - 160) / 45.0
+    dy = (yy - 160) / 45.0
+    d2 = dx * dx + dy * dy
+    apple_m = d2 <= 1.0
+    nz = np.sqrt(np.clip(1.0 - d2, 0.0, 1.0))
+    shade = np.clip(0.45 + 0.55 * np.clip(-0.25 * dx - 0.25 * dy + 0.90 * nz, 0.25, 1.0), 0.35, 1.0)
+    halo = np.exp(-d2 / 0.14)
+    patch = im_sh.astype(np.float32)
+    for c_i, b in enumerate((18, 20, 205)):
+        val = b * shade + halo * (95.0 if c_i < 2 else 50.0)
+        patch[..., c_i] = np.where(apple_m, np.clip(val, 0.0, 255.0), patch[..., c_i])
+    im_sh = patch.astype(np.uint8)
+    cv2.circle(im_sh, (160, 160), 10, (245, 245, 245), -1)
+    refs_sh, _ = detect_in_rect(im_sh, config=cfg)
+    assert len(refs_sh) == 1
+
+    # 5. 5Pent(floor=0.0) on green background -> 5
+    im_5p = np.full((480, 640, 3), (75, 110, 80), dtype=np.uint8)
+    rad5 = 54.0 / (2.0 * math.sin(math.pi / 5.0))
+    for k in range(5):
+        th = math.radians(72 * k - 90)
+        cx = int(round(320 + rad5 * math.cos(th)))
+        cy = int(round(240 + rad5 * math.sin(th)))
+        y0, y1 = cy - 34, cy + 35
+        x0, x1 = cx - 34, cx + 35
+        gy, gx = np.ogrid[y0:y1, x0:x1]
+        gdx = (gx - cx) / 32.0
+        gdy = (gy - cy) / 32.0
+        gd2 = gdx * gdx + gdy * gdy
+        gm = gd2 <= 1.0
+        gnz = np.sqrt(np.clip(1.0 - gd2, 0.0, 1.0))
+        gndotl = np.clip(-0.45 * gdx - 0.45 * gdy + 0.77 * gnz, 0.0, 1.0)
+        gp = im_5p[y0:y1, x0:x1].astype(np.float32)
+        for c_i, b in enumerate((18, 20, 205)):
+            gp[..., c_i] = np.where(gm, np.clip(b * (0.52 + 0.58 * gndotl), 0.0, 255.0), gp[..., c_i])
+        im_5p[y0:y1, x0:x1] = gp.astype(np.uint8)
+    refs_5p, _ = detect_in_rect(im_5p, config=cfg)
+    assert len(refs_5p) == 5
+
+
+

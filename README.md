@@ -71,7 +71,7 @@ Key capabilities:
 |---|---:|---:|---:|---:|---:|
 | `orchard_scene.png` | 12 | 12 | 12 (`F1=1.000`) | 12 | — |
 | `dense_crate_scene.png` | 46 (+10 distractors) | 56 (`P=0.821`) | 46 (`P=1.000, R=1.000`) | 20 (`R=0.435`) | — |
-| `bagged_apples_scene.png` | 16 (glare + veil) | 16 | 16 (`F1=1.000`) | 4 (`R=0.250`) | 5 (`R=0.312`) |
+| `bagged_apples_scene.png` | 16 (glare + veil) | 16 | 16 (`F1=1.000`) | 4 (`R=0.250`) | 4 (`R=0.250`) |
 | `negative_foliage_scene.png` | 0 | 0 | 0 | 0 | — |
 
 ---
@@ -191,7 +191,7 @@ Tính năng chính:
 |---|---:|---:|---:|---:|---:|
 | `orchard_scene.png` | 12 | 12 | 12 (`F1=1.000`) | 12 | — |
 | `dense_crate_scene.png` | 46 (+10 nhiễu) | 56 (`P=0.821`) | 46 (`P=1.000, R=1.000`) | 20 (`R=0.435`) | — |
-| `bagged_apples_scene.png` | 16 (túi + lóa) | 16 | 16 (`F1=1.000`) | 4 (`R=0.250`) | 5 (`R=0.312`) |
+| `bagged_apples_scene.png` | 16 (túi + lóa) | 16 | 16 (`F1=1.000`) | 4 (`R=0.250`) | 4 (`R=0.250`) |
 | `negative_foliage_scene.png` | 0 | 0 | 0 | 0 | — |
 
 ---

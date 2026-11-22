@@ -533,4 +533,108 @@ def test_e2e_iteration6_glare_rings_offcenter_ellipses_and_clusters_across_modes
             )
 
 
+def test_e2e_iteration7_power_voronoi_ellip_rings_thickc_kidney_and_glare() -> None:
+    import math
+
+    def _bg(color: tuple[int, int, int] = (75, 110, 80)) -> np.ndarray:
+        return np.full((480, 640, 3), color, dtype=np.uint8)
+
+    def _draw_shaded(img: np.ndarray, cx: int, cy: int, r: int, floor: float = 0.0) -> None:
+        y0, y1 = max(0, cy - r - 2), min(img.shape[0], cy + r + 3)
+        x0, x1 = max(0, cx - r - 2), min(img.shape[1], cx + r + 3)
+        yy, xx = np.ogrid[y0:y1, x0:x1]
+        dx = (xx - cx) / float(r)
+        dy = (yy - cy) / float(r)
+        d2 = dx * dx + dy * dy
+        m = d2 <= 1.0
+        nz = np.sqrt(np.clip(1.0 - d2, 0.0, 1.0))
+        ndotl = np.clip(-0.45 * dx - 0.45 * dy + 0.77 * nz, floor, 1.0)
+        patch = img[y0:y1, x0:x1].astype(np.float32)
+        for c_i, b in enumerate((18, 20, 205)):
+            patch[..., c_i] = np.where(
+                m, np.clip(b * (0.52 + 0.58 * ndotl), 0.0, 255.0), patch[..., c_i]
+            )
+        img[y0:y1, x0:x1] = patch.astype(np.uint8)
+
+    cases: list[tuple[str, np.ndarray, int, list[tuple[str, float]]]] = []
+    all_modes = [("hybrid", 0.65), ("hybrid", 0.15), ("hsv", 0.65), ("auto", 0.65)]
+
+    # 1. Unequal(16, 38, d=48/49) -> 2
+    for d in (48, 49):
+        im_u = _bg()
+        cv2.circle(im_u, (320 - d // 2, 240), 16, (18, 20, 205), -1)
+        cv2.circle(im_u, (320 + (d - d // 2), 240), 38, (18, 20, 205), -1)
+        cases.append((f"Unequal_16_38_d{d}", im_u, 2, all_modes))
+
+    # 2. Ellip_42x28_ang0_shift4_leaf8x4 -> 1 (specifically guards auto@0.65)
+    im_el = _bg()
+    cv2.ellipse(im_el, (320, 240), (42, 28), 0, 0, 360, (18, 20, 205), -1)
+    for sgn in (-1, 1):
+        cv2.ellipse(im_el, (324, 240 + sgn * 25), (8, 4), 0, 0, 360, (35, 130, 45), -1)
+    cases.append(("Ellip_42x28_ang0_shift4_leaf8x4", im_el, 1, all_modes))
+
+    # 3. Ring_r40_t52, Ring_r45_t58, Ring_r50_t62 on white & green backgrounds -> 0
+    for bg_name, bg_c in [("white", (245, 245, 245)), ("green", (75, 110, 80))]:
+        for r, t in [(40, 52), (45, 58), (50, 62)]:
+            im_r = _bg(bg_c)
+            cv2.circle(im_r, (320, 240), r, (18, 20, 205), thickness=t)
+            cases.append((f"Ring_r{r}_t{t}_{bg_name}", im_r, 0, all_modes))
+
+    # 4. ThickC_60_58_g70, ThickC_70_68_g80, Kidney_80_32, Kidney_80_38 -> 0
+    for name, draw_fn in [
+        ("ThickC_60_58_g70", lambda im: cv2.ellipse(im, (320, 240), (60, 60), 0, 35, 325, (18, 20, 205), thickness=58)),
+        ("ThickC_70_68_g80", lambda im: cv2.ellipse(im, (320, 240), (70, 70), 0, 40, 320, (18, 20, 205), thickness=68)),
+        ("Kidney_80_32", lambda im: cv2.ellipse(im, (320, 270), (80, 80), 0, 210, 330, (18, 20, 205), thickness=32)),
+        ("Kidney_80_38", lambda im: cv2.ellipse(im, (320, 270), (80, 80), 0, 210, 330, (18, 20, 205), thickness=38)),
+    ]:
+        im_v = _bg()
+        draw_fn(im_v)
+        cases.append((name, im_v, 0, all_modes))
+
+    # 5. 5Pent(floor=0.0) on green & white -> 5
+    for bg_name, bg_c, mode_list in [
+        ("green", (75, 110, 80), all_modes),
+        ("white", (245, 245, 245), [("hybrid", 0.65), ("hybrid", 0.15), ("hsv", 0.65)]),
+    ]:
+        im_5p = _bg(bg_c)
+        rad5 = 54.0 / (2.0 * math.sin(math.pi / 5.0))
+        for k in range(5):
+            th = math.radians(72 * k - 90)
+            _draw_shaded(
+                im_5p,
+                int(round(320 + rad5 * math.cos(th))),
+                int(round(240 + rad5 * math.sin(th))),
+                32,
+                floor=0.0,
+            )
+        cases.append((f"5Pent_floor0_{bg_name}", im_5p, 5, mode_list))
+
+    # 6. AppleShaded_w245_r45_g10 on white -> 1
+    im_sh = _bg((245, 245, 245))
+    y0, y1, x0, x1 = 240 - 47, 240 + 48, 320 - 47, 320 + 48
+    yy, xx = np.ogrid[y0:y1, x0:x1]
+    dx = (xx - 320) / 45.0
+    dy = (yy - 240) / 45.0
+    d2 = dx * dx + dy * dy
+    am = d2 <= 1.0
+    nz = np.sqrt(np.clip(1.0 - d2, 0.0, 1.0))
+    shade = np.clip(0.45 + 0.55 * np.clip(-0.25 * dx - 0.25 * dy + 0.90 * nz, 0.25, 1.0), 0.35, 1.0)
+    halo = np.exp(-d2 / 0.14)
+    patch = im_sh[y0:y1, x0:x1].astype(np.float32)
+    for c_i, b in enumerate((18, 20, 205)):
+        val = b * shade + halo * (95.0 if c_i < 2 else 50.0)
+        patch[..., c_i] = np.where(am, np.clip(val, 0.0, 255.0), patch[..., c_i])
+    im_sh[y0:y1, x0:x1] = patch.astype(np.uint8)
+    cv2.circle(im_sh, (320, 240), 10, (245, 245, 245), -1)
+    cases.append(("AppleShaded_w245_r45_g10", im_sh, 1, all_modes))
+
+    for name, img, expected, mode_list in cases:
+        for mode, conf in mode_list:
+            res = HybridAppleDetector(PipelineConfig(mode=mode, yolo_conf=conf)).process_frame(img)
+            assert len(res.detections) == expected, (
+                f"{name} failed in {mode}@{conf}: got {len(res.detections)}, expected {expected}"
+            )
+
+
+
 
