@@ -8,6 +8,7 @@ from typing import Any, Protocol
 import cv2
 import numpy as np
 
+from .refinement import extract_blob_components
 from .types import DetectionCandidate
 
 
@@ -108,7 +109,7 @@ def decode_yolov8_output(
     elif channels_first is False:
         preds = arr
     else:
-        if arr.shape[0] < 5 and arr.shape[1] not in (5, 84):
+        if arr.shape[0] < 5 and arr.shape[1] != 5:
             raise ValueError(
                 f"Expected at least 5 channels (cx,cy,w,h,cls...), got {arr.shape[0]}"
             )
@@ -314,69 +315,11 @@ class CalibratedProposerBackend:
 
     Operates exclusively on raw BGR pixel statistics (warm chromatic prominence, auxiliary
     CLAHE-V / luminance-normalized dark-shadow red contrast, gradient contours,
-    saddle-pinch-gated distance-transform peak splitting, and local patch scoring).
+    pinch-gated blob splitting, and local patch scoring).
     Zero filename inspection or external ground-truth data is ever used.
     """
 
     name: str = "calibrated"
-
-    @staticmethod
-    def _group_pinched_peaks(
-        sub_fg: np.ndarray,
-        dist_s: np.ndarray,
-        cents: np.ndarray,
-        pinch_ratio: float = 0.78,
-    ) -> list[int]:
-        """Merge candidate peaks that are not separated by a genuine narrow saddle/pinch valley."""
-        k_count = len(cents)
-        parent = list(range(k_count))
-
-        def _find(u: int) -> int:
-            while parent[u] != u:
-                parent[u] = parent[parent[u]]
-                u = parent[u]
-            return u
-
-        def _union(u: int, v: int) -> None:
-            ru, rv = _find(u), _find(v)
-            if ru != rv:
-                parent[rv] = ru
-
-        sh, sw = sub_fg.shape[:2]
-        pk_coords = [
-            (
-                int(np.clip(round(float(c[0])), 0, sw - 1)),
-                int(np.clip(round(float(c[1])), 0, sh - 1)),
-            )
-            for c in cents
-        ]
-        heights = [float(dist_s[py, px]) for px, py in pk_coords]
-
-        pairs: list[tuple[float, int, int]] = []
-        for i in range(k_count):
-            for j in range(i + 1, k_count):
-                tau = pinch_ratio * min(heights[i], heights[j])
-                pairs.append((round(tau, 2), i, j))
-        pairs.sort(reverse=True)
-
-        lbl_cache: dict[float, np.ndarray] = {}
-        fg_positive = sub_fg > 0
-        for tau, i, j in pairs:
-            if _find(i) == _find(j):
-                continue
-            lbl = lbl_cache.get(tau)
-            if lbl is None:
-                level_mask = ((dist_s >= tau) & fg_positive).astype(np.uint8)
-                _, lbl = cv2.connectedComponents(level_mask)
-                lbl_cache[tau] = lbl
-            xi, yi = pk_coords[i]
-            xj, yj = pk_coords[j]
-            li = int(lbl[yi, xi])
-            lj = int(lbl[yj, xj])
-            if li > 0 and li == lj:
-                _union(i, j)
-
-        return [_find(i) for i in range(k_count)]
 
     def detect(self, frame_bgr: np.ndarray, conf_thresh: float) -> list[DetectionCandidate]:
         h, w = frame_bgr.shape[:2]
@@ -427,46 +370,31 @@ class CalibratedProposerBackend:
         cgy = cv2.Sobel(vv_eq.astype(np.float32), cv2.CV_32F, 0, 1, ksize=3)
         dark_grad = np.maximum(np.hypot(cgx, cgy), 0.75 * np.hypot(drx, dry))
 
-        raw_boxes: list[tuple[int, int, int, int]] = []
+        raw_boxes: list[tuple[int, int, int, int, bool]] = []
         for cc_id in range(1, num_cc):
             x0, y0, cw, ch, carea = [int(v) for v in cc_stats[cc_id]]
             if carea < 180 or cw < 12 or ch < 12:
                 continue
             sub_fg = (cc_labels[y0 : y0 + ch, x0 : x0 + cw] == cc_id).astype(np.uint8) * 255
-            dist = cv2.distanceTransform(sub_fg, cv2.DIST_L2, 5)
-            dist_s = cv2.GaussianBlur(dist, (7, 7), 0)
-            dil = cv2.dilate(dist_s, np.ones((25, 25), np.uint8))
-            peaks = (dist_s >= dil - 1e-5) & (dist_s >= 4.0) & (sub_fg > 0)
-            n_pk, _, _, pk_centroids = cv2.connectedComponentsWithStats(peaks.astype(np.uint8))
-
-            if n_pk <= 2:
-                raw_boxes.append((x0, y0, x0 + cw, y0 + ch))
-            else:
-                cents = pk_centroids[1:]
-                roots = self._group_pinched_peaks(sub_fg, dist_s, cents, pinch_ratio=0.78)
-                unique_roots = sorted(set(roots))
-                if len(unique_roots) <= 1:
-                    raw_boxes.append((x0, y0, x0 + cw, y0 + ch))
-                else:
-                    ys, xs = np.where(sub_fg > 0)
-                    pts = np.stack([xs, ys], axis=1)
-                    d2 = ((pts[:, None, :] - cents[None, :, :]) ** 2).sum(axis=2)
-                    nearest = np.argmin(d2, axis=1)
-                    root_arr = np.asarray(roots, dtype=np.int32)
-                    assigned_root = root_arr[nearest]
-                    for grp in unique_roots:
-                        sel = assigned_root == grp
-                        if int(np.count_nonzero(sel)) < 120:
-                            continue
-                        kxs = pts[sel, 0] + x0
-                        kys = pts[sel, 1] + y0
-                        raw_boxes.append(
-                            (int(kxs.min()), int(kys.min()), int(kxs.max()) + 1, int(kys.max()) + 1)
-                        )
+            parts = extract_blob_components(sub_fg, min_area=120)
+            is_split = len(parts) >= 2
+            for part in parts:
+                pys, pxs = np.where(part > 0)
+                if pys.size < 120:
+                    continue
+                raw_boxes.append(
+                    (
+                        int(pxs.min()) + x0,
+                        int(pys.min()) + y0,
+                        int(pxs.max()) + 1 + x0,
+                        int(pys.max()) + 1 + y0,
+                        is_split,
+                    )
+                )
 
         candidates: list[DetectionCandidate] = []
         pad = 3
-        for x1, y1, x2, y2 in raw_boxes:
+        for x1, y1, x2, y2, is_split in raw_boxes:
             px1 = max(0, x1 - pad)
             py1 = max(0, y1 - pad)
             px2 = min(w, x2 + pad)
@@ -480,23 +408,29 @@ class CalibratedProposerBackend:
             roi_s = ss[py1:py2, px1:px2]
             roi_v = vv[py1:py2, px1:px2]
 
+            grad_pct = 95 if is_split else 93
             warm_score = float(np.clip(np.percentile(roi_red, 85) / 160.0, 0.0, 1.0))
-            edge_score = float(np.clip(np.percentile(roi_grad, 93) / 185.0, 0.0, 1.0))
+            edge_score = float(np.clip(np.percentile(roi_grad, grad_pct) / 185.0, 0.0, 1.0))
             glare_frac = float(np.mean((roi_v > 230) & (roi_s < 45)))
             fill_frac = float(np.mean(roi_warm > 38.0))
             fill_score = min(1.0, fill_frac / 0.45)
 
             roi_v_p85 = float(np.percentile(roi_v, 85))
             roi_s_p85 = float(np.percentile(roi_s, 85))
-            if roi_v_p85 < 115.0 and roi_s_p85 >= 90.0:
+            if roi_v_p85 < 125.0 and roi_s_p85 >= 110.0:
+                dark_weight = float(np.clip((125.0 - roi_v_p85) / 35.0, 0.0, 1.0))
+            elif roi_v_p85 < 115.0 and roi_s_p85 >= 90.0:
                 dark_weight = float(np.clip((115.0 - roi_v_p85) / 35.0, 0.0, 1.0))
+            else:
+                dark_weight = 0.0
+            if dark_weight > 0.0:
                 roi_dred = dark_red_prom[py1:py2, px1:px2]
                 roi_dgrad = dark_grad[py1:py2, px1:px2]
                 roi_dcue = dark_red_cue[py1:py2, px1:px2]
                 roi_cwarm = clahe_warm[py1:py2, px1:px2]
 
                 d_warm_score = float(np.clip(np.percentile(roi_dred, 85) / 160.0, 0.0, 1.0))
-                d_edge_score = float(np.clip(np.percentile(roi_dgrad, 93) / 185.0, 0.0, 1.0))
+                d_edge_score = float(np.clip(np.percentile(roi_dgrad, grad_pct) / 185.0, 0.0, 1.0))
                 d_fill_frac = float(np.mean((roi_cwarm > 38.0) | roi_dcue))
                 d_fill_score = min(1.0, d_fill_frac / 0.45)
 

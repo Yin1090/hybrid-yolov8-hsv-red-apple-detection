@@ -227,3 +227,25 @@ def test_cli_validation_and_clean_error_exits(tmp_path: Path, capsys) -> None:
     assert rc_onnx == 2
     assert "error:" in capsys.readouterr().err
 
+
+def test_yolo_mode_filters_non_finite_and_degenerate_boxes() -> None:
+    from hybrid_apple_detector.types import DetectionCandidate
+
+    class _MockInvalidBackend:
+        name = "mock"
+
+        def detect(self, frame_bgr: np.ndarray, conf_thresh: float) -> list[DetectionCandidate]:
+            return [
+                DetectionCandidate((10, 10, 50, 50), yconf=float("nan")),
+                DetectionCandidate((float("nan"), 10, 50, 50), yconf=0.92),  # type: ignore[arg-type]
+                DetectionCandidate((20, 20, 20, 60), yconf=0.90),
+                DetectionCandidate((80, 80, 40, 120), yconf=0.88),
+                DetectionCandidate((100, 100, 150, 150), yconf=0.85),
+            ]
+
+    det = HybridAppleDetector(PipelineConfig(mode="yolo"), backend=_MockInvalidBackend())
+    res = det.process_frame(np.zeros((200, 200, 3), dtype=np.uint8))
+    assert len(res.detections) == 1
+    assert res.detections[0].bbox == (100, 100, 150, 150)
+    assert res.detections[0].score_final == pytest.approx(0.85)
+

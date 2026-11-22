@@ -186,3 +186,23 @@ def test_refine_and_calibrator_reject_nan_oob_and_empty_rois() -> None:
     assert rect_rc is None
     assert prof_rc.sampled_pixels == 0
     assert logs_rc == ["[ROI CLICK] ignored out-of-bounds"]
+
+
+def test_admissibility_solidity_boundary_and_thick_c_ribbon_rejection() -> None:
+    from hybrid_apple_detector.refinement import _check_admissibility
+
+    cfg = PipelineConfig()
+    assert _check_admissibility(0.20, 0.60, 0.60, 0.50, 1.0, True, cfg)[0] is False
+    assert _check_admissibility(0.20, 0.60, 0.600001, 0.50, 1.0, True, cfg)[0] is True
+
+    # Thick C_r70_t40 has solidity ~0.64 > 0.60 and passes circularity/extent,
+    # yet is rejected for its annular concave void.
+    scene = np.full((480, 640, 3), (75, 110, 80), dtype=np.uint8)
+    cv2.ellipse(scene, (320, 240), (70, 70), 0, 35, 325, (18, 20, 205), thickness=40)
+    res = refine_candidate(scene, DetectionCandidate((227, 147, 400, 334), yconf=0.60), config=cfg)
+    assert res.solidity > 0.60
+    assert res.circularity > 0.25
+    assert res.passed is False
+    assert res.reject_reason == "concave_void_ribbon"
+    refs, _ = detect_in_rect(scene, config=cfg)
+    assert len(refs) == 0

@@ -143,6 +143,294 @@ def _check_admissibility(
     return True, None
 
 
+def is_annular_or_ribbon_void(
+    mask: np.ndarray,
+    cnt: np.ndarray | None = None,
+) -> bool:
+    """Detect hollow annular arcs and uniform-stroke concave ribbons with deep interior voids."""
+    if cnt is None:
+        contours = _find_external_contours(mask)
+        if not contours:
+            return False
+        cnt = max(contours, key=cv2.contourArea)
+
+    area = float(cv2.contourArea(cnt))
+    if area <= 0.0:
+        return False
+    hull_area = float(cv2.contourArea(cv2.convexHull(cnt)))
+    solidity = (area / hull_area) if hull_area > 0.0 else 0.0
+    if solidity >= 0.72:
+        return False
+
+    bx, by, bw, bh = cv2.boundingRect(cnt)
+    if bw <= 0 or bh <= 0:
+        return False
+    sub = np.zeros((bh, bw), dtype=np.uint8)
+    cv2.drawContours(sub, [cnt - np.array([[bx, by]])], -1, 255, -1)
+    dist = cv2.distanceTransform(sub, cv2.DIST_L2, 5)
+    max_dt = float(dist.max())
+    (_, _), (mw, mh), _ = cv2.minAreaRect(cnt)
+    minor_span = max(min(float(mw) + 1.0, float(mh) + 1.0), 1.0)
+    thick_ratio = (2.0 * max_dt) / minor_span
+
+    max_defect = 0.0
+    hull_idx = cv2.convexHull(cnt, returnPoints=False)
+    if hull_idx is not None and len(hull_idx) > 3 and len(cnt) > 3:
+        try:
+            defects = cv2.convexityDefects(cnt, hull_idx)
+            if defects is not None and defects.size > 0:
+                max_defect = float(np.max(defects.reshape(-1, 4)[:, 3]) / 256.0)
+        except cv2.error:
+            max_defect = 0.0
+    defect_ratio = max_defect / minor_span
+    return (thick_ratio < 0.48) or (defect_ratio > 0.46 and thick_ratio < 0.55)
+
+
+def extract_blob_components(
+    sub_fg: np.ndarray,
+    min_area: int = 120,
+    pinch_ratio: float = 0.82,
+) -> list[np.ndarray]:
+    """Split touching rounded apple blobs via non-transitive DT saddles & defect pinches.
+
+    Protects uniform-stroke concave ribbons from shattering and prevents interstitial
+    overlap centroids in multi-apple clusters from transitively bridging distinct lobes.
+    """
+    ch, cw = sub_fg.shape[:2]
+    if ch <= 0 or cw <= 0:
+        return []
+    contours = _find_external_contours(sub_fg)
+    if not contours:
+        return []
+    cnt = max(contours, key=cv2.contourArea)
+    if is_annular_or_ribbon_void(sub_fg, cnt):
+        return [sub_fg]
+
+    dist = cv2.distanceTransform(sub_fg, cv2.DIST_L2, 5)
+    dist_s = cv2.GaussianBlur(dist, (3, 3), 0)
+    dil = cv2.dilate(dist_s, np.ones((11, 11), np.uint8))
+    peaks = (dist_s >= dil - 1e-5) & (dist_s >= 4.0) & (sub_fg > 0)
+    n_pk, _, _, pk_cents = cv2.connectedComponentsWithStats(peaks.astype(np.uint8))
+
+    if n_pk > 2:
+        raw_cents = pk_cents[1:]
+        raw_coords = [
+            (
+                int(np.clip(round(float(c[0])), 0, cw - 1)),
+                int(np.clip(round(float(c[1])), 0, ch - 1)),
+            )
+            for c in raw_cents
+        ]
+        raw_heights = [float(dist_s[py, px]) for px, py in raw_coords]
+        max_pk_h = max(raw_heights) if raw_heights else 0.0
+        valid_pk = [i for i, h_val in enumerate(raw_heights) if h_val >= 0.52 * max_pk_h]
+        cents = raw_cents[valid_pk] if len(valid_pk) >= 2 else np.empty((0, 2), dtype=np.float64)
+        k_count = len(cents)
+    else:
+        cents = np.empty((0, 2), dtype=np.float64)
+        k_count = 0
+
+    dt_parts: list[np.ndarray] = []
+    if k_count >= 2:
+        pk_coords = [
+            (
+                int(np.clip(round(float(c[0])), 0, cw - 1)),
+                int(np.clip(round(float(c[1])), 0, ch - 1)),
+            )
+            for c in cents
+        ]
+        heights = [float(dist_s[py, px]) for px, py in pk_coords]
+
+        def _line_saddle(i: int, j: int) -> float:
+            xi, yi = float(cents[i][0]), float(cents[i][1])
+            xj, yj = float(cents[j][0]), float(cents[j][1])
+            n_samp = max(16, int(math.ceil(math.hypot(xj - xi, yj - yi))) + 1)
+            xs = np.clip(np.round(np.linspace(xi, xj, n_samp)).astype(int), 0, cw - 1)
+            ys = np.clip(np.round(np.linspace(yi, yj, n_samp)).astype(int), 0, ch - 1)
+            if not np.all(sub_fg[ys, xs] > 0):
+                return 0.0
+            return float(np.min(dist_s[ys, xs]))
+
+        # Suppress interstitial overlap bridge peaks (e.g. centroid peak inside 3-apple clusters)
+        keep_mask = [True] * k_count
+        for b in range(k_count):
+            unpinched: list[int] = []
+            for i in range(k_count):
+                if i == b:
+                    continue
+                d_bi = math.hypot(cents[b][0] - cents[i][0], cents[b][1] - cents[i][1])
+                if (
+                    d_bi <= 1.30 * max(heights[b], heights[i])
+                    and _line_saddle(b, i) >= 0.85 * min(heights[b], heights[i])
+                ):
+                    unpinched.append(i)
+            if len(unpinched) >= 2:
+                is_bridge = False
+                for ia_idx in range(len(unpinched)):
+                    for ib_idx in range(ia_idx + 1, len(unpinched)):
+                        ia, ib = unpinched[ia_idx], unpinched[ib_idx]
+                        d_ab = math.hypot(
+                            cents[ia][0] - cents[ib][0], cents[ia][1] - cents[ib][1]
+                        )
+                        if (
+                            d_ab >= 1.25 * min(heights[ia], heights[ib])
+                            and _line_saddle(ia, ib) < 0.86 * min(heights[ia], heights[ib])
+                        ):
+                            d_ba = math.hypot(
+                                cents[b][0] - cents[ia][0], cents[b][1] - cents[ia][1]
+                            )
+                            d_bb = math.hypot(
+                                cents[b][0] - cents[ib][0], cents[b][1] - cents[ib][1]
+                            )
+                            if d_ab > max(d_ba, d_bb):
+                                is_bridge = True
+                                break
+                    if is_bridge:
+                        break
+                if is_bridge:
+                    keep_mask[b] = False
+
+        kept_indices = [i for i in range(k_count) if keep_mask[i]]
+        if len(kept_indices) >= 2:
+            m_k = len(kept_indices)
+            parent = list(range(m_k))
+
+            def _find(u: int) -> int:
+                while parent[u] != u:
+                    parent[u] = parent[parent[u]]
+                    u = parent[u]
+                return u
+
+            s_ratio = [[1.0] * m_k for _ in range(m_k)]
+            d_norm = [[0.0] * m_k for _ in range(m_k)]
+            pairs: list[tuple[float, int, int]] = []
+            for a in range(m_k):
+                for b in range(a + 1, m_k):
+                    ia, ib = kept_indices[a], kept_indices[b]
+                    dij = math.hypot(
+                        cents[ia][0] - cents[ib][0], cents[ia][1] - cents[ib][1]
+                    )
+                    min_h = max(min(heights[ia], heights[ib]), 1e-6)
+                    sr = _line_saddle(ia, ib) / min_h
+                    s_ratio[a][b] = s_ratio[b][a] = sr
+                    d_norm[a][b] = d_norm[b][a] = dij / min_h
+                    pairs.append((sr, a, b))
+
+            pairs.sort(reverse=True)
+            for sr, a, b in pairs:
+                if sr < pinch_ratio and d_norm[a][b] >= 1.15:
+                    continue
+                ra, rb = _find(a), _find(b)
+                if ra == rb:
+                    continue
+                comp_a = [x for x in range(m_k) if _find(x) == ra]
+                comp_b = [x for x in range(m_k) if _find(x) == rb]
+                if not any(
+                    s_ratio[x][y] < pinch_ratio and d_norm[x][y] >= 1.15
+                    for x in comp_a
+                    for y in comp_b
+                ):
+                    parent[rb] = ra
+
+            roots = [_find(u) for u in range(m_k)]
+            unique_roots = sorted(set(roots))
+            if len(unique_roots) >= 2:
+                grp_centers = [
+                    np.mean(
+                        [cents[kept_indices[u]] for u in range(m_k) if roots[u] == grp],
+                        axis=0,
+                    )
+                    for grp in unique_roots
+                ]
+                grp_arr = np.asarray(grp_centers, dtype=np.float64)
+                ys, xs = np.where(sub_fg > 0)
+                pts = np.stack([xs, ys], axis=1)
+                d2 = ((pts[:, None, :] - grp_arr[None, :, :]) ** 2).sum(axis=2)
+                nearest = np.argmin(d2, axis=1)
+                parts: list[np.ndarray] = []
+                for gi in range(len(unique_roots)):
+                    sel = nearest == gi
+                    if int(np.count_nonzero(sel)) < min_area:
+                        continue
+                    part = np.zeros_like(sub_fg)
+                    part[ys[sel], xs[sel]] = 255
+                    parts.append(part)
+                if len(parts) >= 2:
+                    dt_parts = parts
+
+    # Convexity-defect pinch splitting when heavy closing merges DT peaks or misses a lobe
+    max_dt = float(dist.max())
+    if max_dt >= 8.0:
+        (_, _), (mw, mh), _ = cv2.minAreaRect(cnt)
+        major = max(float(mw) + 1.0, float(mh) + 1.0)
+        area = float(cv2.contourArea(cnt))
+        hull_area = float(cv2.contourArea(cv2.convexHull(cnt)))
+        solidity = (area / hull_area) if hull_area > 0.0 else 0.0
+        if (major / (2.0 * max_dt)) >= 1.35 and solidity >= 0.78:
+            hull_idx = cv2.convexHull(cnt, returnPoints=False)
+            if hull_idx is not None and len(hull_idx) > 3 and len(cnt) > 3:
+                try:
+                    defects = cv2.convexityDefects(cnt, hull_idx)
+                except cv2.error:
+                    defects = None
+                if defects is not None and defects.size > 0:
+                    d_arr = defects.reshape(-1, 4)
+                    min_depth = max(5.5, 0.16 * max_dt)
+                    cand_defs = sorted(
+                        [
+                            (float(d) / 256.0, (int(cnt[f][0][0]), int(cnt[f][0][1])))
+                            for _, _, f, d in d_arr
+                            if (float(d) / 256.0) >= min_depth
+                        ],
+                        reverse=True,
+                    )
+                    kept_defs: list[tuple[int, int]] = []
+                    for _, pt in cand_defs:
+                        if all(
+                            math.hypot(pt[0] - kp[0], pt[1] - kp[1]) >= 0.7 * max_dt
+                            for kp in kept_defs
+                        ):
+                            kept_defs.append(pt)
+
+                    if (
+                        len(dt_parts) < 2
+                        and len(kept_defs) == 2
+                        and math.hypot(
+                            kept_defs[0][0] - kept_defs[1][0],
+                            kept_defs[0][1] - kept_defs[1][1],
+                        )
+                        <= 1.85 * max_dt
+                    ):
+                        cut = sub_fg.copy()
+                        cv2.line(cut, kept_defs[0], kept_defs[1], 0, 2)
+                        n_c, lbl_c, st_c, _ = cv2.connectedComponentsWithStats(cut)
+                        parts = [
+                            (lbl_c == cid).astype(np.uint8) * 255
+                            for cid in range(1, n_c)
+                            if int(st_c[cid, cv2.CC_STAT_AREA]) >= min_area
+                        ]
+                        if len(parts) >= 2:
+                            return parts
+                    elif len(kept_defs) >= 3 and len(kept_defs) > len(dt_parts):
+                        my, mx = np.unravel_index(int(np.argmax(dist)), dist.shape)
+                        center = (int(mx), int(my))
+                        cut = sub_fg.copy()
+                        for pt in kept_defs:
+                            cv2.line(cut, center, pt, 0, 2)
+                        n_c, lbl_c, st_c, _ = cv2.connectedComponentsWithStats(cut)
+                        parts = [
+                            (lbl_c == cid).astype(np.uint8) * 255
+                            for cid in range(1, n_c)
+                            if int(st_c[cid, cv2.CC_STAT_AREA]) >= min_area
+                        ]
+                        if len(parts) >= len(kept_defs):
+                            return parts
+
+    if len(dt_parts) >= 2:
+        return dt_parts
+    return [sub_fg]
+
+
 class AdaptiveHSVCalibrator:
     """Interactive/programmatic ROI HSV sampler (ROI_HALF=100, 20th/80th percentiles)."""
 
@@ -334,6 +622,9 @@ def refine_candidate(
     passed, reject_reason = _check_admissibility(
         red_ratio, circularity, solidity, extent, aspect_ratio, has_contour, cfg
     )
+    if passed and is_annular_or_ribbon_void(mask):
+        passed = False
+        reject_reason = "concave_void_ribbon"
     hsv_conf = compute_hsv_conf(red_ratio, circularity, solidity, extent, aspect_ratio) if passed else 0.0
 
     return RefinementResult(
@@ -400,35 +691,49 @@ def detect_in_rect(
         if bw <= 0 or bh <= 0:
             continue
 
-        sub_mask = mask[by : by + bh, bx : bx + bw]
-        red_ratio, circularity, solidity, extent, aspect_ratio, has_contour = compute_geometry_metrics(sub_mask)
-        passed, reject_reason = _check_admissibility(
-            red_ratio, circularity, solidity, extent, aspect_ratio, has_contour, cfg
-        )
-        if not passed:
-            continue
+        cnt_mask = np.zeros((bh, bw), dtype=np.uint8)
+        cv2.drawContours(cnt_mask, [cnt - np.array([[bx, by]])], -1, 255, -1)
+        sub_fg = cv2.bitwise_and(mask[by : by + bh, bx : bx + bw], cnt_mask)
+        parts = extract_blob_components(sub_fg, min_area=cfg.min_contour_area)
 
-        hsv_conf = compute_hsv_conf(red_ratio, circularity, solidity, extent, aspect_ratio)
-        cand = DetectionCandidate(
-            bbox=(rx1 + bx, ry1 + by, rx1 + bx + bw, ry1 + by + bh),
-            yconf=hsv_conf,
-            label="red_apple",
-            backend="hsv",
-        )
-        results.append(
-            RefinementResult(
-                candidate=cand,
-                passed=True,
-                reject_reason=None,
-                red_ratio=red_ratio,
-                circularity=circularity,
-                solidity=solidity,
-                extent=extent,
-                aspect_ratio=aspect_ratio,
-                hsv_conf=hsv_conf,
-                roi_mask=sub_mask,
+        for part in parts:
+            pys, pxs = np.where(part > 0)
+            if pys.size == 0:
+                continue
+            px1 = int(pxs.min())
+            py1 = int(pys.min())
+            px2 = int(pxs.max()) + 1
+            py2 = int(pys.max()) + 1
+            sub_mask = part[py1:py2, px1:px2]
+
+            red_ratio, circularity, solidity, extent, aspect_ratio, has_contour = compute_geometry_metrics(sub_mask)
+            passed, _ = _check_admissibility(
+                red_ratio, circularity, solidity, extent, aspect_ratio, has_contour, cfg
             )
-        )
+            if not passed or is_annular_or_ribbon_void(sub_mask):
+                continue
+
+            hsv_conf = compute_hsv_conf(red_ratio, circularity, solidity, extent, aspect_ratio)
+            cand = DetectionCandidate(
+                bbox=(rx1 + bx + px1, ry1 + by + py1, rx1 + bx + px2, ry1 + by + py2),
+                yconf=hsv_conf,
+                label="red_apple",
+                backend="hsv",
+            )
+            results.append(
+                RefinementResult(
+                    candidate=cand,
+                    passed=True,
+                    reject_reason=None,
+                    red_ratio=red_ratio,
+                    circularity=circularity,
+                    solidity=solidity,
+                    extent=extent,
+                    aspect_ratio=aspect_ratio,
+                    hsv_conf=hsv_conf,
+                    roi_mask=sub_mask,
+                )
+            )
 
     full_mask = np.zeros((h, w), dtype=np.uint8)
     full_mask[ry1:ry2, rx1:rx2] = mask

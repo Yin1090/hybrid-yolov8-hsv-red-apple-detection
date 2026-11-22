@@ -161,6 +161,28 @@ def test_decode_yolov8_output_validates_channels_class_id_and_small_n() -> None:
     assert len(cands_cl) == 1
     assert cands_cl[0].bbox == (270, 270, 370, 370)
 
+    # Ambiguous malformed [1, 4, 84] with channels_first=None must raise ValueError,
+    # while explicit channels_first=False decodes [1, 4, 84] and [1, 4, 6] as N=4 predictions.
+    ambig_4_84 = np.zeros((1, 4, 84), dtype=np.float32)
+    ambig_4_84[0, 0, :4] = [320.0, 320.0, 80.0, 80.0]
+    ambig_4_84[0, 0, 4 + 47] = 0.92
+    with pytest.raises(ValueError, match="at least 5 channels"):
+        decode_yolov8_output(ambig_4_84, 0.5, 1.0, 0.0, 0.0, (640, 640))
+
+    explicit_cl = decode_yolov8_output(
+        ambig_4_84, 0.5, 1.0, 0.0, 0.0, (640, 640), target_class_id=47, channels_first=False
+    )
+    assert len(explicit_cl) == 1
+    assert explicit_cl[0].bbox == (280, 280, 360, 360)
+
+    explicit_4_6 = np.zeros((1, 4, 6), dtype=np.float32)
+    explicit_4_6[0, 0, :5] = [320.0, 320.0, 80.0, 80.0, 0.90]
+    cands_4_6 = decode_yolov8_output(
+        explicit_4_6, 0.5, 1.0, 0.0, 0.0, (640, 640), channels_first=False
+    )
+    assert len(cands_4_6) == 1
+    assert cands_4_6[0].bbox == (280, 280, 360, 360)
+
 
 def test_calibrated_proposer_avoids_ribbon_shattering_splits_touching_and_recalls_dark_apples() -> None:
     # Concave L-ribbon & C-ribbon (standard & thicker variants) -> 0 FPs, touching apples -> 2 detections
@@ -201,3 +223,40 @@ def test_calibrated_proposer_avoids_ribbon_shattering_splits_touching_and_recall
         cv2.circle(dark, (260, 215), 25, (35, 35, 45), -1)
         res_dark = HybridAppleDetector(PipelineConfig(mode="hybrid", yolo_conf=0.65)).process_frame(dark)
         assert len(res_dark.detections) == 5
+
+    # Moderate-saturation flat dark shadow (V=110, S=160) recalls smoothly at yolo_conf=0.65
+    hsv_bg = np.zeros((240, 360, 3), dtype=np.uint8)
+    hsv_bg[:, :] = (60, 20, 40)
+    dark_110 = cv2.cvtColor(hsv_bg, cv2.COLOR_HSV2BGR)
+    ap_hsv = np.zeros((1, 1, 3), dtype=np.uint8)
+    ap_hsv[0, 0] = (2, 160, 110)
+    ap_bgr = tuple(int(v) for v in cv2.cvtColor(ap_hsv, cv2.COLOR_HSV2BGR)[0, 0])
+    for cx in (80, 180, 280):
+        cv2.circle(dark_110, (cx, 120), 30, ap_bgr, -1)
+    cv2.circle(dark_110, (180, 200), 22, (45, 45, 45), -1)
+    res_110 = HybridAppleDetector(PipelineConfig(mode="hybrid", yolo_conf=0.65)).process_frame(dark_110)
+    assert len(res_110.detections) == 3
+
+
+def test_cluster_splitting_and_thick_c_ribbon_rejection_across_modes() -> None:
+    import math
+
+    # 3-apple triangle clusters (3T_r30_d58, 3T_r35_d48) & deep-overlap 2-apple (2H_r35_d48)
+    for r, d, centers_fn, expected in [
+        (30, 58, lambda cx, cy, dd: [(cx - dd // 2, cy - int(round(dd * math.sqrt(3) / 6))), (cx + dd - dd // 2, cy - int(round(dd * math.sqrt(3) / 6))), (cx, cy + int(round(dd * math.sqrt(3) / 3)))], 3),
+        (35, 48, lambda cx, cy, dd: [(cx - dd // 2, cy - int(round(dd * math.sqrt(3) / 6))), (cx + dd - dd // 2, cy - int(round(dd * math.sqrt(3) / 6))), (cx, cy + int(round(dd * math.sqrt(3) / 3)))], 3),
+        (35, 48, lambda cx, cy, dd: [(cx - dd // 2, cy), (cx + dd - dd // 2, cy)], 2),
+    ]:
+        scene = np.full((320, 320, 3), (75, 110, 80), dtype=np.uint8)
+        for x0, y0 in centers_fn(160, 160, d):
+            cv2.circle(scene, (x0, y0), r, (18, 20, 205), -1)
+        for mode in ("hybrid", "hsv", "auto"):
+            res = HybridAppleDetector(PipelineConfig(mode=mode, yolo_conf=0.65)).process_frame(scene)
+            assert len(res.detections) == expected, f"r={r}, d={d}, mode={mode}"
+
+    # Thick concave C-ribbon (C_r70_t40) rejected across hybrid@0.15, hsv, and auto
+    c_ribbon = np.full((480, 640, 3), (75, 110, 80), dtype=np.uint8)
+    cv2.ellipse(c_ribbon, (320, 240), (70, 70), 0, 35, 325, (18, 20, 205), thickness=40)
+    for mode, yc in (("hybrid", 0.15), ("hsv", 0.65), ("auto", 0.65)):
+        res_c = HybridAppleDetector(PipelineConfig(mode=mode, yolo_conf=yc)).process_frame(c_ribbon)
+        assert len(res_c.detections) == 0, f"C_r70_t40 failed in mode={mode} yc={yc}"

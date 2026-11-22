@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import time
 from typing import Literal
 
@@ -143,22 +144,35 @@ class HybridAppleDetector:
 
         elif mode == "yolo":
             candidates = self.backend.detect(frame, self.config.yolo_conf)
-            raw_dets = [
-                HybridDetection(
-                    bbox=c.bbox,
-                    score_final=c.yconf,
-                    yconf=c.yconf,
-                    hsv_conf=0.0,
-                    red_ratio=0.0,
-                    circularity=0.0,
-                    solidity=0.0,
-                    extent=0.0,
-                    aspect_ratio=0.0,
-                    bypassed=True,
-                    label=c.label,
+            raw_dets: list[HybridDetection] = []
+            for c in candidates:
+                bx1, by1, bx2, by2 = c.bbox
+                if not (
+                    math.isfinite(float(bx1))
+                    and math.isfinite(float(by1))
+                    and math.isfinite(float(bx2))
+                    and math.isfinite(float(by2))
+                    and math.isfinite(float(c.yconf))
+                ):
+                    continue
+                if bx2 <= bx1 or by2 <= by1:
+                    continue
+                yconf_f = float(np.clip(float(c.yconf), 0.0, 1.0))
+                raw_dets.append(
+                    HybridDetection(
+                        bbox=c.bbox,
+                        score_final=yconf_f,
+                        yconf=yconf_f,
+                        hsv_conf=0.0,
+                        red_ratio=0.0,
+                        circularity=0.0,
+                        solidity=0.0,
+                        extent=0.0,
+                        aspect_ratio=0.0,
+                        bypassed=True,
+                        label=c.label,
+                    )
                 )
-                for c in candidates
-            ]
             detections = nms_hybrid_boxes(raw_dets, iou_threshold=self.config.nms_iou_thresh)
             hsv_mask = segment_full_frame_hsv(
                 frame, self.calibrator.profile, self.config, active_roi=self.active_roi
