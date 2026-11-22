@@ -249,3 +249,104 @@ def test_yolo_mode_filters_non_finite_and_degenerate_boxes() -> None:
     assert res.detections[0].bbox == (100, 100, 150, 150)
     assert res.detections[0].score_final == pytest.approx(0.85)
 
+
+def test_e2e_voids_rejected_and_extended_clusters_preserved_across_modes() -> None:
+    import math
+
+    def _bg() -> np.ndarray:
+        return np.full((480, 640, 3), (75, 110, 80), dtype=np.uint8)
+
+    # 1. Closed ring, near-closed C-arc, clipped C-ribbon, U_t42, J_t42 -> 0 across all modes
+    void_scenes = []
+    s_ring = _bg()
+    cv2.circle(s_ring, (320, 240), 65, (18, 20, 205), thickness=36)
+    void_scenes.append(("Ring_r65_t36", s_ring))
+
+    s_arc = _bg()
+    cv2.ellipse(s_arc, (320, 240), (70, 70), 0, 20, 340, (18, 20, 205), thickness=40)
+    void_scenes.append(("C_r70_t40_ang20_340", s_arc))
+
+    s_clip = _bg()
+    cv2.ellipse(s_clip, (20, 240), (70, 70), 0, -145, 145, (18, 20, 205), thickness=40)
+    void_scenes.append(("C_clipped_x0", s_clip))
+
+    s_u = _bg()
+    cv2.polylines(
+        s_u,
+        [np.array([[250, 150], [250, 300], [370, 300], [370, 150]], dtype=np.int32)],
+        False,
+        (18, 20, 205),
+        42,
+    )
+    void_scenes.append(("U_t42", s_u))
+
+    s_j = _bg()
+    cv2.line(s_j, (360, 130), (360, 280), (18, 20, 205), 42)
+    cv2.ellipse(s_j, (310, 280), (50, 50), 0, 0, 180, (18, 20, 205), 42)
+    void_scenes.append(("J_t42", s_j))
+
+    for name, img in void_scenes:
+        for mode in ("hybrid", "hsv", "auto"):
+            res = HybridAppleDetector(PipelineConfig(mode=mode, yolo_conf=0.15)).process_frame(img)
+            assert len(res.detections) == 0, f"{name} failed in {mode}"
+
+    # 2. Collinear 3Row_D30 -> 3, Double-leaf single apple -> 1, 3T_rot30 -> 3, 4Sq/4Diam -> 4, Unequal -> 2
+    def _draw_shaded(img: np.ndarray, cx: int, cy: int, r: int) -> None:
+        y0, y1 = max(0, cy - r - 2), min(img.shape[0], cy + r + 3)
+        x0, x1 = max(0, cx - r - 2), min(img.shape[1], cx + r + 3)
+        yy, xx = np.ogrid[y0:y1, x0:x1]
+        dx = (xx - cx) / float(r)
+        dy = (yy - cy) / float(r)
+        d2 = dx * dx + dy * dy
+        m = d2 <= 1.0
+        nz = np.sqrt(np.clip(1.0 - d2, 0.0, 1.0))
+        ndotl = np.clip(-0.45 * dx - 0.45 * dy + 0.77 * nz, 0.30, 1.0)
+        patch = img[y0:y1, x0:x1].astype(np.float32)
+        for c, b in enumerate((18, 20, 205)):
+            patch[..., c] = np.where(m, np.clip(b * (0.52 + 0.58 * ndotl), 0.0, 255.0), patch[..., c])
+        img[y0:y1, x0:x1] = patch.astype(np.uint8)
+
+    im_row = _bg()
+    for k in (-1, 0, 1):
+        _draw_shaded(
+            im_row,
+            320 + int(round(k * 54 * math.cos(math.radians(30)))),
+            240 + int(round(k * 54 * math.sin(math.radians(30)))),
+            32,
+        )
+
+    im_leaf = _bg()
+    cv2.circle(im_leaf, (320, 240), 36, (18, 20, 205), -1)
+    cv2.ellipse(im_leaf, (292, 220), (14, 7), 25, 0, 360, (25, 125, 28), -1)
+    cv2.ellipse(im_leaf, (348, 222), (14, 7), -25, 0, 360, (25, 125, 28), -1)
+
+    im_3t = _bg()
+    rad = 48.0 / math.sqrt(3.0)
+    for k in range(3):
+        th = math.radians(30 + 120 * k - 90)
+        cv2.circle(im_3t, (int(round(320 + rad * math.cos(th))), int(round(240 + rad * math.sin(th)))), 35, (18, 20, 205), -1)
+
+    im_4sq = _bg()
+    for cx, cy in [(295, 215), (345, 215), (295, 265), (345, 265)]:
+        cv2.circle(im_4sq, (cx, cy), 35, (18, 20, 205), -1)
+
+    im_4diam = _bg()
+    for cx, cy in [(320, 205), (355, 240), (320, 275), (285, 240)]:
+        cv2.circle(im_4diam, (cx, cy), 35, (18, 20, 205), -1)
+
+    im_un = _bg()
+    cv2.circle(im_un, (290, 240), 18, (18, 20, 205), -1)
+    cv2.circle(im_un, (338, 240), 38, (18, 20, 205), -1)
+
+    for name, img, expected in [
+        ("3Row_D30", im_row, 3),
+        ("Apple_double_leaf_small", im_leaf, 1),
+        ("3T_rot30_r35_d48", im_3t, 3),
+        ("4Sq_r35_d50", im_4sq, 4),
+        ("4Diam_r35_d50", im_4diam, 4),
+        ("Unequal_18_38_d48", im_un, 2),
+    ]:
+        for mode in ("hybrid", "hsv", "auto"):
+            res = HybridAppleDetector(PipelineConfig(mode=mode, yolo_conf=0.65)).process_frame(img)
+            assert len(res.detections) == expected, f"{name} failed in {mode}: got {len(res.detections)}"
+

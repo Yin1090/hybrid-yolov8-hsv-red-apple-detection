@@ -206,3 +206,125 @@ def test_admissibility_solidity_boundary_and_thick_c_ribbon_rejection() -> None:
     assert res.reject_reason == "concave_void_ribbon"
     refs, _ = detect_in_rect(scene, config=cfg)
     assert len(refs) == 0
+
+
+def test_padded_dt_and_closed_ring_near_closed_arc_clipped_and_uj_rejection() -> None:
+    from hybrid_apple_detector.refinement import (
+        _padded_distance_transform,
+        extract_blob_components,
+        is_annular_or_ribbon_void,
+    )
+
+    solid_60 = np.full((60, 60), 255, dtype=np.uint8)
+    dist_60 = _padded_distance_transform(solid_60)
+    assert float(dist_60.max()) == pytest.approx(30.0, abs=1.0)
+    assert is_annular_or_ribbon_void(solid_60) is False
+    assert len(extract_blob_components(solid_60)) == 1
+
+    cfg = PipelineConfig()
+    # Closed ring (r=65, t=36), near-closed C-arc (ang 20..340), clipped C-ribbon, U_t42, J_t42
+    shapes = []
+
+    def _bg() -> np.ndarray:
+        return np.full((480, 640, 3), (75, 110, 80), dtype=np.uint8)
+
+    s_ring = _bg()
+    cv2.circle(s_ring, (320, 240), 65, (18, 20, 205), thickness=36)
+    shapes.append(("ring", s_ring, (220, 140, 420, 340)))
+
+    s_arc = _bg()
+    cv2.ellipse(s_arc, (320, 240), (70, 70), 0, 20, 340, (18, 20, 205), thickness=40)
+    shapes.append(("near_closed_c", s_arc, (220, 140, 420, 340)))
+
+    s_clip = _bg()
+    cv2.ellipse(s_clip, (20, 240), (70, 70), 0, -145, 145, (18, 20, 205), thickness=40)
+    shapes.append(("clipped_c", s_clip, (0, 140, 120, 340)))
+
+    s_u = _bg()
+    cv2.polylines(
+        s_u,
+        [np.array([[250, 150], [250, 300], [370, 300], [370, 150]], dtype=np.int32)],
+        False,
+        (18, 20, 205),
+        42,
+    )
+    shapes.append(("u_t42", s_u, (220, 120, 400, 330)))
+
+    s_j = _bg()
+    cv2.line(s_j, (360, 130), (360, 280), (18, 20, 205), 42)
+    cv2.ellipse(s_j, (310, 280), (50, 50), 0, 0, 180, (18, 20, 205), 42)
+    shapes.append(("j_t42", s_j, (230, 100, 390, 360)))
+
+    for label, scene, box in shapes:
+        res = refine_candidate(scene, DetectionCandidate(box, yconf=0.60), config=cfg)
+        assert res.passed is False, f"{label} unexpectedly passed refine_candidate"
+        refs, _ = detect_in_rect(scene, config=cfg)
+        assert len(refs) == 0, f"{label} unexpectedly passed detect_in_rect"
+
+
+def test_cluster_splitting_collinear_double_leaf_rotated_3t_4sq_4diam_and_unequal() -> None:
+    import math
+
+    cfg = PipelineConfig()
+
+    def _draw_shaded(img: np.ndarray, cx: int, cy: int, r: int) -> None:
+        y0, y1 = max(0, cy - r - 2), min(img.shape[0], cy + r + 3)
+        x0, x1 = max(0, cx - r - 2), min(img.shape[1], cx + r + 3)
+        yy, xx = np.ogrid[y0:y1, x0:x1]
+        dx = (xx - cx) / float(r)
+        dy = (yy - cy) / float(r)
+        d2 = dx * dx + dy * dy
+        m = d2 <= 1.0
+        nz = np.sqrt(np.clip(1.0 - d2, 0.0, 1.0))
+        ndotl = np.clip(-0.45 * dx - 0.45 * dy + 0.77 * nz, 0.30, 1.0)
+        patch = img[y0:y1, x0:x1].astype(np.float32)
+        for c, b in enumerate((18, 20, 205)):
+            patch[..., c] = np.where(m, np.clip(b * (0.52 + 0.58 * ndotl), 0.0, 255.0), patch[..., c])
+        img[y0:y1, x0:x1] = patch.astype(np.uint8)
+
+    # 3-in-a-row collinear shaded cluster -> 3 (no middle-apple halving)
+    im_row = np.full((480, 640, 3), (75, 110, 80), dtype=np.uint8)
+    for k in (-1, 0, 1):
+        _draw_shaded(
+            im_row,
+            320 + int(round(k * 54 * math.cos(math.radians(30)))),
+            240 + int(round(k * 54 * math.sin(math.radians(30)))),
+            32,
+        )
+    refs_row, _ = detect_in_rect(im_row, config=cfg)
+    assert len(refs_row) == 3
+
+    # Double-leaf-notched single apple -> 1
+    im_leaf = np.full((480, 640, 3), (75, 110, 80), dtype=np.uint8)
+    cv2.circle(im_leaf, (320, 240), 36, (18, 20, 205), -1)
+    cv2.ellipse(im_leaf, (292, 220), (14, 7), 25, 0, 360, (25, 125, 28), -1)
+    cv2.ellipse(im_leaf, (348, 222), (14, 7), -25, 0, 360, (25, 125, 28), -1)
+    refs_leaf, _ = detect_in_rect(im_leaf, config=cfg)
+    assert len(refs_leaf) == 1
+
+    # Rotated 3T_r35_d48 at 30 deg -> 3
+    im_3t = np.full((480, 640, 3), (75, 110, 80), dtype=np.uint8)
+    rad = 48.0 / math.sqrt(3.0)
+    for k in range(3):
+        th = math.radians(30 + 120 * k - 90)
+        cv2.circle(im_3t, (int(round(320 + rad * math.cos(th))), int(round(240 + rad * math.sin(th)))), 35, (18, 20, 205), -1)
+    refs_3t, _ = detect_in_rect(im_3t, config=cfg)
+    assert len(refs_3t) == 3
+
+    # 4Sq_r35_d50 & 4Diam_r35_d50 -> 4
+    for pts in (
+        [(295, 215), (345, 215), (295, 265), (345, 265)],
+        [(320, 205), (355, 240), (320, 275), (285, 240)],
+    ):
+        im_4 = np.full((480, 640, 3), (75, 110, 80), dtype=np.uint8)
+        for cx, cy in pts:
+            cv2.circle(im_4, (cx, cy), 35, (18, 20, 205), -1)
+        refs_4, _ = detect_in_rect(im_4, config=cfg)
+        assert len(refs_4) == 4
+
+    # Unequal 18+38 @ d=48 -> 2
+    im_un = np.full((480, 640, 3), (75, 110, 80), dtype=np.uint8)
+    cv2.circle(im_un, (290, 240), 18, (18, 20, 205), -1)
+    cv2.circle(im_un, (338, 240), 38, (18, 20, 205), -1)
+    refs_un, _ = detect_in_rect(im_un, config=cfg)
+    assert len(refs_un) == 2

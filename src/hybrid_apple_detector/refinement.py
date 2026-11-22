@@ -20,6 +20,13 @@ def _find_external_contours(mask: np.ndarray) -> list[np.ndarray]:
     return list(contours)
 
 
+def _padded_distance_transform(fg_mask: np.ndarray) -> np.ndarray:
+    """Compute L2 distance transform with a 1px zero border so edges are bounded."""
+    padded = cv2.copyMakeBorder(fg_mask, 1, 1, 1, 1, cv2.BORDER_CONSTANT, value=0)
+    dist = cv2.distanceTransform(padded, cv2.DIST_L2, 5)
+    return dist[1:-1, 1:-1]
+
+
 def preprocess_roi_hsv(
     roi_bgr: np.ndarray,
     gaussian_ksize: int = 5,
@@ -73,12 +80,30 @@ def compute_geometry_metrics(mask: np.ndarray) -> tuple[float, float, float, flo
         return 0.0, 0.0, 0.0, 0.0, 0.0, False
 
     red_ratio = float(np.count_nonzero(mask)) / total_pixels
-    contours = _find_external_contours(mask)
+    res = cv2.findContours(mask, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+    contours, hierarchy = (res[0], res[1]) if len(res) == 2 else (res[1], res[2])
     if not contours:
         return red_ratio, 0.0, 0.0, 0.0, 0.0, False
 
-    cnt = max(contours, key=cv2.contourArea)
-    area = float(cv2.contourArea(cnt))
+    hier = hierarchy[0] if hierarchy is not None else None
+    top_indices = (
+        [i for i in range(len(contours)) if hier[i][3] == -1]
+        if hier is not None
+        else list(range(len(contours)))
+    )
+    if not top_indices:
+        top_indices = list(range(len(contours)))
+    top_idx = max(top_indices, key=lambda i: float(cv2.contourArea(contours[i])))
+    cnt = contours[top_idx]
+    outer_area = float(cv2.contourArea(cnt))
+    hole_area = 0.0
+    if hier is not None:
+        hole_area = sum(
+            float(cv2.contourArea(contours[j]))
+            for j in range(len(contours))
+            if hier[j][3] == top_idx
+        )
+    area = max(0.0, outer_area - hole_area)
     if area <= 0.0:
         return red_ratio, 0.0, 0.0, 0.0, 0.0, False
 
@@ -147,31 +172,40 @@ def is_annular_or_ribbon_void(
     mask: np.ndarray,
     cnt: np.ndarray | None = None,
 ) -> bool:
-    """Detect hollow annular arcs and uniform-stroke concave ribbons with deep interior voids."""
+    """Detect closed annular rings, hollow arcs, and uniform-stroke concave ribbons."""
     if cnt is None:
         contours = _find_external_contours(mask)
         if not contours:
             return False
         cnt = max(contours, key=cv2.contourArea)
 
-    area = float(cv2.contourArea(cnt))
-    if area <= 0.0:
-        return False
-    hull_area = float(cv2.contourArea(cv2.convexHull(cnt)))
-    solidity = (area / hull_area) if hull_area > 0.0 else 0.0
-    if solidity >= 0.72:
+    outer_area = float(cv2.contourArea(cnt))
+    if outer_area <= 0.0:
         return False
 
     bx, by, bw, bh = cv2.boundingRect(cnt)
     if bw <= 0 or bh <= 0:
         return False
-    sub = np.zeros((bh, bw), dtype=np.uint8)
-    cv2.drawContours(sub, [cnt - np.array([[bx, by]])], -1, 255, -1)
-    dist = cv2.distanceTransform(sub, cv2.DIST_L2, 5)
+    cnt_fill = np.zeros((bh, bw), dtype=np.uint8)
+    cv2.drawContours(cnt_fill, [cnt - np.array([[bx, by]])], -1, 255, -1)
+    sub_fg = cv2.bitwise_and(mask[by : by + bh, bx : bx + bw], cnt_fill)
+    fg_area = float(np.count_nonzero(sub_fg))
+    if fg_area <= 0.0:
+        return False
+
+    hull_area = float(cv2.contourArea(cv2.convexHull(cnt)))
+    fg_solidity = (fg_area / hull_area) if hull_area > 0.0 else 0.0
+    hole_ratio = 1.0 - (fg_area / outer_area)
+    if fg_solidity >= 0.78 and hole_ratio < 0.15:
+        return False
+
+    dist = _padded_distance_transform(sub_fg)
     max_dt = float(dist.max())
     (_, _), (mw, mh), _ = cv2.minAreaRect(cnt)
     minor_span = max(min(float(mw) + 1.0, float(mh) + 1.0), 1.0)
     thick_ratio = (2.0 * max_dt) / minor_span
+    if hole_ratio >= 0.15 and thick_ratio < 0.52:
+        return True
 
     max_defect = 0.0
     hull_idx = cv2.convexHull(cnt, returnPoints=False)
@@ -193,8 +227,8 @@ def extract_blob_components(
 ) -> list[np.ndarray]:
     """Split touching rounded apple blobs via non-transitive DT saddles & defect pinches.
 
-    Protects uniform-stroke concave ribbons from shattering and prevents interstitial
-    overlap centroids in multi-apple clusters from transitively bridging distinct lobes.
+    Protects uniform-stroke concave ribbons and closed rings from shattering, and prevents
+    interstitial overlap centroids in multi-apple clusters from transitively bridging lobes.
     """
     ch, cw = sub_fg.shape[:2]
     if ch <= 0 or cw <= 0:
@@ -206,9 +240,9 @@ def extract_blob_components(
     if is_annular_or_ribbon_void(sub_fg, cnt):
         return [sub_fg]
 
-    dist = cv2.distanceTransform(sub_fg, cv2.DIST_L2, 5)
+    dist = _padded_distance_transform(sub_fg)
     dist_s = cv2.GaussianBlur(dist, (3, 3), 0)
-    dil = cv2.dilate(dist_s, np.ones((11, 11), np.uint8))
+    dil = cv2.dilate(dist_s, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11)))
     peaks = (dist_s >= dil - 1e-5) & (dist_s >= 4.0) & (sub_fg > 0)
     n_pk, _, _, pk_cents = cv2.connectedComponentsWithStats(peaks.astype(np.uint8))
 
@@ -223,7 +257,9 @@ def extract_blob_components(
         ]
         raw_heights = [float(dist_s[py, px]) for px, py in raw_coords]
         max_pk_h = max(raw_heights) if raw_heights else 0.0
-        valid_pk = [i for i, h_val in enumerate(raw_heights) if h_val >= 0.52 * max_pk_h]
+        valid_pk = [
+            i for i, h_val in enumerate(raw_heights) if h_val >= 0.40 * max_pk_h and h_val >= 6.0
+        ]
         cents = raw_cents[valid_pk] if len(valid_pk) >= 2 else np.empty((0, 2), dtype=np.float64)
         k_count = len(cents)
     else:
@@ -231,6 +267,7 @@ def extract_blob_components(
         k_count = 0
 
     dt_parts: list[np.ndarray] = []
+    kept_heights: list[float] = []
     if k_count >= 2:
         pk_coords = [
             (
@@ -291,6 +328,7 @@ def extract_blob_components(
                     keep_mask[b] = False
 
         kept_indices = [i for i in range(k_count) if keep_mask[i]]
+        kept_heights = [heights[i] for i in kept_indices]
         if len(kept_indices) >= 2:
             m_k = len(kept_indices)
             parent = list(range(m_k))
@@ -363,10 +401,11 @@ def extract_blob_components(
     if max_dt >= 8.0:
         (_, _), (mw, mh), _ = cv2.minAreaRect(cnt)
         major = max(float(mw) + 1.0, float(mh) + 1.0)
+        minor = max(min(float(mw) + 1.0, float(mh) + 1.0), 1.0)
         area = float(cv2.contourArea(cnt))
         hull_area = float(cv2.contourArea(cv2.convexHull(cnt)))
         solidity = (area / hull_area) if hull_area > 0.0 else 0.0
-        if (major / (2.0 * max_dt)) >= 1.35 and solidity >= 0.78:
+        if (major / (2.0 * max_dt)) >= 1.08 and solidity >= 0.78:
             hull_idx = cv2.convexHull(cnt, returnPoints=False)
             if hull_idx is not None and len(hull_idx) > 3 and len(cnt) > 3:
                 try:
@@ -375,7 +414,7 @@ def extract_blob_components(
                     defects = None
                 if defects is not None and defects.size > 0:
                     d_arr = defects.reshape(-1, 4)
-                    min_depth = max(5.5, 0.16 * max_dt)
+                    min_depth = max(5.5, 0.11 * max_dt)
                     cand_defs = sorted(
                         [
                             (float(d) / 256.0, (int(cnt[f][0][0]), int(cnt[f][0][1])))
@@ -395,6 +434,8 @@ def extract_blob_components(
                     if (
                         len(dt_parts) < 2
                         and len(kept_defs) == 2
+                        and (major / (2.0 * max_dt)) >= 1.28
+                        and (major / minor) >= 1.25
                         and math.hypot(
                             kept_defs[0][0] - kept_defs[1][0],
                             kept_defs[0][1] - kept_defs[1][1],
@@ -410,21 +451,51 @@ def extract_blob_components(
                             if int(st_c[cid, cv2.CC_STAT_AREA]) >= min_area
                         ]
                         if len(parts) >= 2:
-                            return parts
-                    elif len(kept_defs) >= 3 and len(kept_defs) > len(dt_parts):
+                            areas = sorted(
+                                [int(np.count_nonzero(p)) for p in parts],
+                                reverse=True,
+                            )
+                            if (areas[1] / max(areas[0], 1)) >= 0.12:
+                                valid_parts = True
+                                for p in parts:
+                                    _, _, psol, _, par, has_c = compute_geometry_metrics(p)
+                                    if not has_c or psol < 0.75 or par > 1.65:
+                                        valid_parts = False
+                                        break
+                                if valid_parts:
+                                    return parts
+                    elif len(kept_defs) >= 3 and (
+                        len(dt_parts) < 2
+                        or (
+                            len(kept_defs) > len(dt_parts)
+                            and (major / minor) < 1.65
+                            and bool(kept_heights)
+                            and max_dt >= 1.12 * min(kept_heights)
+                        )
+                    ):
                         my, mx = np.unravel_index(int(np.argmax(dist)), dist.shape)
                         center = (int(mx), int(my))
-                        cut = sub_fg.copy()
-                        for pt in kept_defs:
-                            cv2.line(cut, center, pt, 0, 2)
-                        n_c, lbl_c, st_c, _ = cv2.connectedComponentsWithStats(cut)
-                        parts = [
-                            (lbl_c == cid).astype(np.uint8) * 255
-                            for cid in range(1, n_c)
-                            if int(st_c[cid, cv2.CC_STAT_AREA]) >= min_area
-                        ]
-                        if len(parts) >= len(kept_defs):
-                            return parts
+                        angs = sorted(
+                            [
+                                math.atan2(pt[1] - center[1], pt[0] - center[0])
+                                for pt in kept_defs
+                            ]
+                        )
+                        gaps = [
+                            angs[i + 1] - angs[i] for i in range(len(angs) - 1)
+                        ] + [2.0 * math.pi - (angs[-1] - angs[0])]
+                        if max(gaps) < math.radians(190.0):
+                            cut = sub_fg.copy()
+                            for pt in kept_defs:
+                                cv2.line(cut, center, pt, 0, 2)
+                            n_c, lbl_c, st_c, _ = cv2.connectedComponentsWithStats(cut)
+                            parts = [
+                                (lbl_c == cid).astype(np.uint8) * 255
+                                for cid in range(1, n_c)
+                                if int(st_c[cid, cv2.CC_STAT_AREA]) >= min_area
+                            ]
+                            if len(parts) >= len(kept_defs):
+                                return parts
 
     if len(dt_parts) >= 2:
         return dt_parts
