@@ -1,0 +1,428 @@
+"""Layer 3: Local ROI refinement, CLAHE(V), Adaptive Split-Range HSV, morphology & geometry."""
+
+from __future__ import annotations
+
+import copy
+import math
+from typing import Tuple
+
+import cv2
+import numpy as np
+
+from .config import ROI_HALF, AdaptiveHSVProfile, PipelineConfig
+from .types import DetectionCandidate, RefinementResult
+
+
+def _find_external_contours(mask: np.ndarray) -> list[np.ndarray]:
+    """OpenCV 3/4/5-safe external contour extraction."""
+    res = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contours = res[0] if len(res) == 2 else res[1]
+    return list(contours)
+
+
+def preprocess_roi_hsv(
+    roi_bgr: np.ndarray,
+    gaussian_ksize: int = 5,
+    clahe_clip_limit: float = 2.0,
+    clahe_grid_size: tuple[int, int] = (8, 8),
+) -> np.ndarray:
+    """Apply 5x5 Gaussian blur, BGR->HSV conversion, and CLAHE strictly on the V channel."""
+    k = gaussian_ksize if gaussian_ksize % 2 == 1 else gaussian_ksize + 1
+    blurred = cv2.GaussianBlur(roi_bgr, (k, k), 0)
+    hsv = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
+    h_ch, s_ch, v_ch = cv2.split(hsv)
+    clahe = cv2.createCLAHE(clipLimit=float(clahe_clip_limit), tileGridSize=clahe_grid_size)
+    v_eq = clahe.apply(v_ch)
+    return cv2.merge([h_ch, s_ch, v_eq])
+
+
+def build_split_red_mask(
+    hsv_eq: np.ndarray,
+    profile: AdaptiveHSVProfile,
+    median_ksize: int = 5,
+    morph_ksize: int = 7,
+    open_iter: int = 1,
+    close_iter: int = 3,
+) -> np.ndarray:
+    """Threshold split-range red hues and apply MedianBlur + Ellipse Open/Close morphology."""
+    low_lo = np.array([profile.low_hue_range[0], profile.s_min, profile.v_min], dtype=np.uint8)
+    low_hi = np.array([profile.low_hue_range[1], profile.s_max, profile.v_max], dtype=np.uint8)
+    high_lo = np.array([profile.high_hue_range[0], profile.s_min, profile.v_min], dtype=np.uint8)
+    high_hi = np.array([profile.high_hue_range[1], profile.s_max, profile.v_max], dtype=np.uint8)
+
+    m1 = cv2.inRange(hsv_eq, low_lo, low_hi)
+    m2 = cv2.inRange(hsv_eq, high_lo, high_hi)
+    mask = cv2.bitwise_or(m1, m2)
+
+    mk = median_ksize if median_ksize % 2 == 1 else median_ksize + 1
+    if mk >= 3:
+        mask = cv2.medianBlur(mask, mk)
+
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (morph_ksize, morph_ksize))
+    if open_iter > 0:
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=open_iter)
+    if close_iter > 0:
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=close_iter)
+    return mask
+
+
+def compute_geometry_metrics(mask: np.ndarray) -> tuple[float, float, float, float, float, bool]:
+    """Compute (red_ratio, circularity, solidity, extent, aspect_ratio, has_contour)."""
+    total_pixels = float(mask.shape[0] * mask.shape[1])
+    if total_pixels <= 0.0:
+        return 0.0, 0.0, 0.0, 0.0, 0.0, False
+
+    red_ratio = float(np.count_nonzero(mask)) / total_pixels
+    contours = _find_external_contours(mask)
+    if not contours:
+        return red_ratio, 0.0, 0.0, 0.0, 0.0, False
+
+    cnt = max(contours, key=cv2.contourArea)
+    area = float(cv2.contourArea(cnt))
+    if area <= 0.0:
+        return red_ratio, 0.0, 0.0, 0.0, 0.0, False
+
+    perim = float(cv2.arcLength(cnt, True))
+    hull = cv2.convexHull(cnt)
+    hull_area = float(cv2.contourArea(hull))
+    _, _, bw, bh = cv2.boundingRect(cnt)
+    rect_area = float(bw * bh) if bw > 0 and bh > 0 else 1.0
+
+    circularity = (4.0 * math.pi * area / (perim * perim)) if perim > 0.0 else 0.0
+    solidity = (area / hull_area) if hull_area > 0.0 else 0.0
+    extent = area / rect_area
+    aspect_ratio = (float(bw) / float(bh)) if bh > 0 else 0.0
+    return red_ratio, circularity, solidity, extent, aspect_ratio, True
+
+
+def compute_hsv_conf(
+    red_ratio: float,
+    circularity: float,
+    solidity: float,
+    extent: float,
+    aspect_ratio: float,
+) -> float:
+    """Compute bounded [0.0, 1.0] HSV confidence combining red area ratio and contour shape."""
+    red_score = min(1.0, max(0.0, red_ratio) / 0.45)
+    circ_s = min(1.0, max(0.0, circularity) / 0.75)
+    sol_s = min(1.0, max(0.0, (solidity - 0.50) / 0.45))
+    ext_s = min(1.0, max(0.0, (extent - 0.35) / 0.40))
+    ar_s = max(0.0, 1.0 - abs(aspect_ratio - 1.0))
+    shape_quality = 0.30 * circ_s + 0.30 * sol_s + 0.20 * ext_s + 0.20 * ar_s
+    return float(np.clip(0.45 * red_score + 0.55 * shape_quality, 0.0, 1.0))
+
+
+def _check_admissibility(
+    red_ratio: float,
+    circularity: float,
+    solidity: float,
+    extent: float,
+    aspect_ratio: float,
+    has_contour: bool,
+    config: PipelineConfig,
+) -> tuple[bool, str | None]:
+    if red_ratio <= config.min_red_ratio:
+        return False, f"red_ratio={red_ratio:.3f}<={config.min_red_ratio:.2f}"
+    if not has_contour:
+        return False, "no_contour"
+    if circularity <= config.min_circularity:
+        return False, f"circularity={circularity:.3f}<={config.min_circularity:.2f}"
+    if solidity <= config.min_solidity:
+        return False, f"solidity={solidity:.3f}<={config.min_solidity:.2f}"
+    if extent <= config.min_extent:
+        return False, f"extent={extent:.3f}<={config.min_extent:.2f}"
+    ar_lo, ar_hi = config.aspect_ratio_range
+    if not (ar_lo <= aspect_ratio <= ar_hi):
+        return False, f"aspect_ratio={aspect_ratio:.2f} not in [{ar_lo}, {ar_hi}]"
+    return True, None
+
+
+class AdaptiveHSVCalibrator:
+    """Interactive/programmatic ROI HSV sampler (ROI_HALF=100, 20th/80th percentiles)."""
+
+    def __init__(self, initial_profile: AdaptiveHSVProfile | None = None) -> None:
+        self._baseline = copy.deepcopy(initial_profile) if initial_profile else AdaptiveHSVProfile()
+        self.profile = copy.deepcopy(self._baseline)
+        self._accumulated_hsv: list[np.ndarray] = []
+
+    def reset(self) -> AdaptiveHSVProfile:
+        """Reset accumulated samples and restore baseline split-range HSV thresholds."""
+        self._accumulated_hsv.clear()
+        self.profile = copy.deepcopy(self._baseline)
+        return self.profile
+
+    def calibrate_from_point(
+        self,
+        frame_bgr: np.ndarray,
+        cx: int,
+        cy: int,
+        roi_half: int = ROI_HALF,
+        clahe_clip_limit: float = 2.0,
+        clahe_grid_size: tuple[int, int] = (8, 8),
+    ) -> Tuple[AdaptiveHSVProfile, tuple[int, int, int, int], list[str]]:
+        """Sample a [cx-roi_half:cx+roi_half, cy-roi_half:cy+roi_half] patch and update HSV bounds."""
+        h, w = frame_bgr.shape[:2]
+        x1 = max(0, int(cx) - int(roi_half))
+        y1 = max(0, int(cy) - int(roi_half))
+        x2 = min(w, int(cx) + int(roi_half))
+        y2 = min(h, int(cy) + int(roi_half))
+        return self.calibrate_from_rect(
+            frame_bgr,
+            (x1, y1, x2, y2),
+            clahe_clip_limit=clahe_clip_limit,
+            clahe_grid_size=clahe_grid_size,
+        )
+
+    def calibrate_from_rect(
+        self,
+        frame_bgr: np.ndarray,
+        rect: tuple[int, int, int, int],
+        clahe_clip_limit: float = 2.0,
+        clahe_grid_size: tuple[int, int] = (8, 8),
+    ) -> Tuple[AdaptiveHSVProfile, tuple[int, int, int, int], list[str]]:
+        """Sample HSV pixels inside rect, adapt S/V via 20th/80th percentiles and H split ranges."""
+        h, w = frame_bgr.shape[:2]
+        x1 = max(0, min(w - 1, int(rect[0])))
+        y1 = max(0, min(h - 1, int(rect[1])))
+        x2 = max(x1 + 1, min(w, int(rect[2])))
+        y2 = max(y1 + 1, min(h, int(rect[3])))
+
+        patch = frame_bgr[y1:y2, x1:x2]
+        hsv_eq = preprocess_roi_hsv(
+            patch,
+            gaussian_ksize=5,
+            clahe_clip_limit=clahe_clip_limit,
+            clahe_grid_size=clahe_grid_size,
+        )
+        hh, ss, vv = cv2.split(hsv_eq)
+        # Filter red-leaning pixels within the clicked ROI (excluding neutral background/glare)
+        red_sel = ((hh <= 18) | (hh >= 155)) & (ss >= 50) & (vv >= 30)
+        if int(np.count_nonzero(red_sel)) >= 25:
+            samples = hsv_eq[red_sel]
+        else:
+            samples = hsv_eq.reshape(-1, 3)
+
+        added_count = int(samples.shape[0])
+        self._accumulated_hsv.append(samples)
+        all_samples = np.vstack(self._accumulated_hsv)
+
+        h_vals = all_samples[:, 0]
+        s_vals = all_samples[:, 1]
+        v_vals = all_samples[:, 2]
+
+        s_p20 = int(round(float(np.percentile(s_vals, 20))))
+        s_p80 = int(round(float(np.percentile(s_vals, 80))))
+        v_p20 = int(round(float(np.percentile(v_vals, 20))))
+        v_p80 = int(round(float(np.percentile(v_vals, 80))))
+
+        s_min = int(np.clip(int(round(s_p20 * 0.65)), 40, 145))
+        v_min = int(np.clip(int(round(v_p20 * 0.75)), 30, 140))
+
+        low_h = h_vals[h_vals <= 18]
+        if low_h.size >= 10:
+            l_lo = int(np.clip(np.floor(np.percentile(low_h, 5)), 0, 12))
+            l_hi = int(np.clip(np.ceil(np.percentile(low_h, 95)), max(l_lo + 3, 8), 15))
+            low_range = (l_lo, l_hi)
+        else:
+            low_range = self._baseline.low_hue_range
+
+        high_h = h_vals[h_vals >= 155]
+        if high_h.size >= 10:
+            h_lo = int(np.clip(np.floor(np.percentile(high_h, 5)), 160, 176))
+            h_hi = int(np.clip(np.ceil(np.percentile(high_h, 95)), max(h_lo + 2, 170), 179))
+            high_range = (h_lo, h_hi)
+        else:
+            high_range = self._baseline.high_hue_range
+
+        self.profile = AdaptiveHSVProfile(
+            low_hue_range=low_range,
+            high_hue_range=high_range,
+            s_min=s_min,
+            s_max=255,
+            v_min=v_min,
+            v_max=255,
+            s_p20=s_p20,
+            s_p80=s_p80,
+            v_p20=v_p20,
+            v_p80=v_p80,
+            sampled_pixels=int(all_samples.shape[0]),
+        )
+        logs = [
+            f"[ROI CLICK] added {added_count} hsv pixels",
+            self.profile.format_calc_log(),
+        ]
+        return self.profile, (x1, y1, x2, y2), logs
+
+
+def refine_candidate(
+    frame_bgr: np.ndarray,
+    candidate: DetectionCandidate,
+    profile: AdaptiveHSVProfile | None = None,
+    config: PipelineConfig | None = None,
+) -> RefinementResult:
+    """Run Layer 3 ROI preprocessing, split-range HSV, morphology, and geometric gates."""
+    cfg = config or PipelineConfig()
+    prof = profile or cfg.initial_hsv
+    h, w = frame_bgr.shape[:2]
+
+    x1, y1, x2, y2 = candidate.bbox
+    cx1 = max(0, min(w - 1, int(x1)))
+    cy1 = max(0, min(h - 1, int(y1)))
+    cx2 = max(cx1 + 1, min(w, int(x2)))
+    cy2 = max(cy1 + 1, min(h, int(y2)))
+
+    roi = frame_bgr[cy1:cy2, cx1:cx2]
+    hsv_eq = preprocess_roi_hsv(
+        roi,
+        gaussian_ksize=cfg.gaussian_ksize,
+        clahe_clip_limit=cfg.clahe_clip_limit,
+        clahe_grid_size=cfg.clahe_grid_size,
+    )
+    mask = build_split_red_mask(
+        hsv_eq,
+        profile=prof,
+        median_ksize=cfg.median_ksize,
+        morph_ksize=cfg.morph_ksize,
+        open_iter=cfg.open_iter,
+        close_iter=cfg.close_iter,
+    )
+    red_ratio, circularity, solidity, extent, aspect_ratio, has_contour = compute_geometry_metrics(mask)
+    passed, reject_reason = _check_admissibility(
+        red_ratio, circularity, solidity, extent, aspect_ratio, has_contour, cfg
+    )
+    hsv_conf = compute_hsv_conf(red_ratio, circularity, solidity, extent, aspect_ratio) if passed else 0.0
+
+    return RefinementResult(
+        candidate=candidate,
+        passed=passed,
+        reject_reason=reject_reason,
+        red_ratio=red_ratio,
+        circularity=circularity,
+        solidity=solidity,
+        extent=extent,
+        aspect_ratio=aspect_ratio,
+        hsv_conf=hsv_conf,
+        roi_mask=mask,
+    )
+
+
+def detect_in_rect(
+    frame_bgr: np.ndarray,
+    rect: tuple[int, int, int, int] | None = None,
+    profile: AdaptiveHSVProfile | None = None,
+    config: PipelineConfig | None = None,
+) -> tuple[list[RefinementResult], np.ndarray]:
+    """Detect and filter red apple contours directly inside rect (or full frame if rect is None)."""
+    cfg = config or PipelineConfig()
+    prof = profile or cfg.initial_hsv
+    h, w = frame_bgr.shape[:2]
+
+    if rect is None:
+        rx1, ry1, rx2, ry2 = 0, 0, w, h
+    else:
+        rx1 = max(0, min(w - 1, int(rect[0])))
+        ry1 = max(0, min(h - 1, int(rect[1])))
+        rx2 = max(rx1 + 1, min(w, int(rect[2])))
+        ry2 = max(ry1 + 1, min(h, int(rect[3])))
+
+    roi = frame_bgr[ry1:ry2, rx1:rx2]
+    hsv_eq = preprocess_roi_hsv(
+        roi,
+        gaussian_ksize=cfg.gaussian_ksize,
+        clahe_clip_limit=cfg.clahe_clip_limit,
+        clahe_grid_size=cfg.clahe_grid_size,
+    )
+    mask = build_split_red_mask(
+        hsv_eq,
+        profile=prof,
+        median_ksize=cfg.median_ksize,
+        morph_ksize=cfg.morph_ksize,
+        open_iter=cfg.open_iter,
+        close_iter=cfg.close_iter,
+    )
+
+    contours = _find_external_contours(mask)
+    results: list[RefinementResult] = []
+    for cnt in contours:
+        area = float(cv2.contourArea(cnt))
+        if area < cfg.min_contour_area:
+            continue
+        bx, by, bw, bh = cv2.boundingRect(cnt)
+        if bw <= 0 or bh <= 0:
+            continue
+
+        sub_mask = mask[by : by + bh, bx : bx + bw]
+        red_ratio, circularity, solidity, extent, aspect_ratio, has_contour = compute_geometry_metrics(sub_mask)
+        passed, reject_reason = _check_admissibility(
+            red_ratio, circularity, solidity, extent, aspect_ratio, has_contour, cfg
+        )
+        if not passed:
+            continue
+
+        hsv_conf = compute_hsv_conf(red_ratio, circularity, solidity, extent, aspect_ratio)
+        cand = DetectionCandidate(
+            bbox=(rx1 + bx, ry1 + by, rx1 + bx + bw, ry1 + by + bh),
+            yconf=hsv_conf,
+            label="red_apple",
+            backend="hsv",
+        )
+        results.append(
+            RefinementResult(
+                candidate=cand,
+                passed=True,
+                reject_reason=None,
+                red_ratio=red_ratio,
+                circularity=circularity,
+                solidity=solidity,
+                extent=extent,
+                aspect_ratio=aspect_ratio,
+                hsv_conf=hsv_conf,
+                roi_mask=sub_mask,
+            )
+        )
+
+    full_mask = np.zeros((h, w), dtype=np.uint8)
+    full_mask[ry1:ry2, rx1:rx2] = mask
+    return results, full_mask
+
+
+def segment_full_frame_hsv(
+    frame_bgr: np.ndarray,
+    profile: AdaptiveHSVProfile | None = None,
+    config: PipelineConfig | None = None,
+    active_roi: tuple[int, int, int, int] | None = None,
+) -> np.ndarray:
+    """Compute the binary HSV mask for the Mask (HSV/ROI) visualization panel."""
+    cfg = config or PipelineConfig()
+    prof = profile or cfg.initial_hsv
+    h, w = frame_bgr.shape[:2]
+
+    if active_roi is None:
+        rx1, ry1, rx2, ry2 = 0, 0, w, h
+    else:
+        rx1 = max(0, min(w - 1, int(active_roi[0])))
+        ry1 = max(0, min(h - 1, int(active_roi[1])))
+        rx2 = max(rx1 + 1, min(w, int(active_roi[2])))
+        ry2 = max(ry1 + 1, min(h, int(active_roi[3])))
+
+    roi = frame_bgr[ry1:ry2, rx1:rx2]
+    hsv_eq = preprocess_roi_hsv(
+        roi,
+        gaussian_ksize=cfg.gaussian_ksize,
+        clahe_clip_limit=cfg.clahe_clip_limit,
+        clahe_grid_size=cfg.clahe_grid_size,
+    )
+    roi_mask = build_split_red_mask(
+        hsv_eq,
+        profile=prof,
+        median_ksize=cfg.median_ksize,
+        morph_ksize=cfg.morph_ksize,
+        open_iter=cfg.open_iter,
+        close_iter=cfg.close_iter,
+    )
+    if active_roi is None:
+        return roi_mask
+
+    full_mask = np.zeros((h, w), dtype=np.uint8)
+    full_mask[ry1:ry2, rx1:rx2] = roi_mask
+    return full_mask

@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hybrid-yolov8-hsv-red-apple-detection"
+version = "1.0.0"
+description = "Coarse-to-fine YOLOv8n + Adaptive Split-Range HSV Red Apple Detection Pipeline"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Yin1090" }]
+dependencies = [
+    "numpy>=1.26",
+    "opencv-python>=4.8",
+]
+
+[project.optional-dependencies]
+onnx = ["onnxruntime>=1.16"]
+yolo = ["ultralytics>=8.0"]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+red-apple-detect = "hybrid_apple_detector.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
