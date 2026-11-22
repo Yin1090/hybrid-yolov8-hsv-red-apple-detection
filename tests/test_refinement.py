@@ -328,3 +328,64 @@ def test_cluster_splitting_collinear_double_leaf_rotated_3t_4sq_4diam_and_unequa
     cv2.circle(im_un, (338, 240), 38, (18, 20, 205), -1)
     refs_un, _ = detect_in_rect(im_un, config=cfg)
     assert len(refs_un) == 2
+
+
+def test_single_leaf_occluded_apples_thick_rings_and_sibling_net_area() -> None:
+    import math
+
+    cfg = PipelineConfig()
+
+    # 1. Single apple with 3 perimeter leaves (12x6, 14x7, 16x8) -> 1 (no 3-pie-wedge over-split)
+    for lx, ly in [(12, 6), (14, 7), (16, 8)]:
+        im_3l = np.full((480, 640, 3), (75, 110, 80), dtype=np.uint8)
+        cv2.circle(im_3l, (320, 240), 36, (18, 20, 205), -1)
+        for deg in (30, 150, 270):
+            cx = int(round(320 + 34 * math.cos(math.radians(deg))))
+            cy = int(round(240 + 34 * math.sin(math.radians(deg))))
+            cv2.ellipse(im_3l, (cx, cy), (lx, ly), deg + 90, 0, 360, (35, 130, 45), -1)
+        refs_3l, _ = detect_in_rect(im_3l, config=cfg)
+        assert len(refs_3l) == 1, f"Apple_3leaf_{lx}x{ly} split into {len(refs_3l)}"
+
+    # 2. Single elliptical apple (35x30, 38x28, 42x28, 45x26) with 2 minor-axis leaves -> 1
+    for rx, ry in [(35, 30), (38, 28), (42, 28), (45, 26)]:
+        for ang in (0, 45, 90):
+            im_el = np.full((480, 640, 3), (75, 110, 80), dtype=np.uint8)
+            cv2.ellipse(im_el, (320, 240), (rx, ry), ang, 0, 360, (18, 20, 205), -1)
+            sa, ca = math.sin(math.radians(ang)), math.cos(math.radians(ang))
+            for sgn in (-1, 1):
+                lx = int(round(320 - sgn * (ry - 2) * sa))
+                ly = int(round(240 + sgn * (ry - 2) * ca))
+                cv2.ellipse(im_el, (lx, ly), (12, 6), ang, 0, 360, (35, 130, 45), -1)
+            refs_el, _ = detect_in_rect(im_el, config=cfg)
+            assert len(refs_el) == 1, f"Ellip_{rx}x{ry}_a{ang}_2leaf split into {len(refs_el)}"
+
+    # 3. Thick closed annular rings just below hole_ratio=0.15 -> 0; small glare apple -> 1
+    for r, t, box in [
+        (70, 58, (215, 135, 425, 345)),
+        (70, 60, (215, 135, 425, 345)),
+        (70, 62, (215, 135, 425, 345)),
+        (60, 48, (230, 150, 410, 330)),
+        (80, 65, (200, 120, 440, 360)),
+    ]:
+        im_ring = np.full((480, 640, 3), (75, 110, 80), dtype=np.uint8)
+        cv2.circle(im_ring, (320, 240), r, (18, 20, 205), thickness=t)
+        res_r = refine_candidate(im_ring, DetectionCandidate(box, yconf=0.60), config=cfg)
+        assert res_r.passed is False
+        refs_r, _ = detect_in_rect(im_ring, config=cfg)
+        assert len(refs_r) == 0, f"Ring_r{r}_t{t} emitted {len(refs_r)} detections"
+
+    im_glare = np.full((480, 640, 3), (75, 110, 80), dtype=np.uint8)
+    cv2.circle(im_glare, (320, 240), 36, (18, 20, 205), -1)
+    cv2.circle(im_glare, (320, 240), 8, (245, 245, 245), -1)
+    refs_gl, _ = detect_in_rect(im_glare, config=cfg)
+    assert len(refs_gl) == 1
+
+    # 4. Sibling selection by net foreground area (outer_area - hole_area)
+    m_sib = np.zeros((240, 320), dtype=np.uint8)
+    cv2.circle(m_sib, (80, 120), 50, 255, thickness=6)  # larger outer area, small net area
+    cv2.circle(m_sib, (230, 120), 40, 255, -1)          # smaller outer area, larger net area
+    _, circ_sib, sol_sib, _, _, has_sib = compute_geometry_metrics(m_sib)
+    assert has_sib is True
+    assert circ_sib > 0.85
+    assert sol_sib > 0.95
+

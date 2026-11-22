@@ -93,17 +93,25 @@ def compute_geometry_metrics(mask: np.ndarray) -> tuple[float, float, float, flo
     )
     if not top_indices:
         top_indices = list(range(len(contours)))
-    top_idx = max(top_indices, key=lambda i: float(cv2.contourArea(contours[i])))
-    cnt = contours[top_idx]
-    outer_area = float(cv2.contourArea(cnt))
-    hole_area = 0.0
-    if hier is not None:
-        hole_area = sum(
-            float(cv2.contourArea(contours[j]))
-            for j in range(len(contours))
-            if hier[j][3] == top_idx
+
+    def _net_area(idx: int) -> float:
+        outer = float(cv2.contourArea(contours[idx]))
+        holes = (
+            sum(
+                float(cv2.contourArea(contours[j]))
+                for j in range(len(contours))
+                if hier[j][3] == idx
+            )
+            if hier is not None
+            else 0.0
         )
-    area = max(0.0, outer_area - hole_area)
+        return max(0.0, outer - holes)
+
+    top_idx, area = max(
+        ((i, _net_area(i)) for i in top_indices),
+        key=lambda item: item[1],
+    )
+    cnt = contours[top_idx]
     if area <= 0.0:
         return red_ratio, 0.0, 0.0, 0.0, 0.0, False
 
@@ -196,7 +204,7 @@ def is_annular_or_ribbon_void(
     hull_area = float(cv2.contourArea(cv2.convexHull(cnt)))
     fg_solidity = (fg_area / hull_area) if hull_area > 0.0 else 0.0
     hole_ratio = 1.0 - (fg_area / outer_area)
-    if fg_solidity >= 0.78 and hole_ratio < 0.15:
+    if fg_solidity >= 0.78 and hole_ratio < 0.04:
         return False
 
     dist = _padded_distance_transform(sub_fg)
@@ -204,7 +212,7 @@ def is_annular_or_ribbon_void(
     (_, _), (mw, mh), _ = cv2.minAreaRect(cnt)
     minor_span = max(min(float(mw) + 1.0, float(mh) + 1.0), 1.0)
     thick_ratio = (2.0 * max_dt) / minor_span
-    if hole_ratio >= 0.15 and thick_ratio < 0.52:
+    if (hole_ratio >= 0.06 and thick_ratio < 0.45) or (hole_ratio >= 0.15 and thick_ratio < 0.52):
         return True
 
     max_defect = 0.0
@@ -241,6 +249,15 @@ def extract_blob_components(
         return [sub_fg]
 
     dist = _padded_distance_transform(sub_fg)
+    max_dt = float(dist.max())
+    (_, _), (mw, mh), _ = cv2.minAreaRect(cnt)
+    major = max(float(mw) + 1.0, float(mh) + 1.0)
+    minor = max(min(float(mw) + 1.0, float(mh) + 1.0), 1.0)
+    area = float(cv2.contourArea(cnt))
+    hull_area = float(cv2.contourArea(cv2.convexHull(cnt)))
+    solidity = (area / hull_area) if hull_area > 0.0 else 0.0
+    thick_ratio = (2.0 * max_dt) / minor
+
     dist_s = cv2.GaussianBlur(dist, (3, 3), 0)
     dil = cv2.dilate(dist_s, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11)))
     peaks = (dist_s >= dil - 1e-5) & (dist_s >= 4.0) & (sub_fg > 0)
@@ -393,18 +410,13 @@ def extract_blob_components(
                     part = np.zeros_like(sub_fg)
                     part[ys[sel], xs[sel]] = 255
                     parts.append(part)
+                if len(parts) == 2 and thick_ratio < 0.93 and solidity < 0.94:
+                    parts = []
                 if len(parts) >= 2:
                     dt_parts = parts
 
     # Convexity-defect pinch splitting when heavy closing merges DT peaks or misses a lobe
-    max_dt = float(dist.max())
     if max_dt >= 8.0:
-        (_, _), (mw, mh), _ = cv2.minAreaRect(cnt)
-        major = max(float(mw) + 1.0, float(mh) + 1.0)
-        minor = max(min(float(mw) + 1.0, float(mh) + 1.0), 1.0)
-        area = float(cv2.contourArea(cnt))
-        hull_area = float(cv2.contourArea(cv2.convexHull(cnt)))
-        solidity = (area / hull_area) if hull_area > 0.0 else 0.0
         if (major / (2.0 * max_dt)) >= 1.08 and solidity >= 0.78:
             hull_idx = cv2.convexHull(cnt, returnPoints=False)
             if hull_idx is not None and len(hull_idx) > 3 and len(cnt) > 3:
@@ -434,6 +446,7 @@ def extract_blob_components(
                     if (
                         len(dt_parts) < 2
                         and len(kept_defs) == 2
+                        and (thick_ratio >= 0.93 or solidity >= 0.945)
                         and (major / (2.0 * max_dt)) >= 1.28
                         and (major / minor) >= 1.25
                         and math.hypot(
@@ -442,8 +455,20 @@ def extract_blob_components(
                         )
                         <= 1.85 * max_dt
                     ):
+                        p0, p1 = kept_defs
+                        n_samp = max(
+                            16, int(math.ceil(math.hypot(p1[0] - p0[0], p1[1] - p0[1]))) + 1
+                        )
+                        cxs = np.clip(
+                            np.round(np.linspace(p0[0], p1[0], n_samp)).astype(int), 0, cw - 1
+                        )
+                        cys = np.clip(
+                            np.round(np.linspace(p0[1], p1[1], n_samp)).astype(int), 0, ch - 1
+                        )
+                        cut_max_dt = float(np.max(dist[cys, cxs]))
+
                         cut = sub_fg.copy()
-                        cv2.line(cut, kept_defs[0], kept_defs[1], 0, 2)
+                        cv2.line(cut, p0, p1, 0, 2)
                         n_c, lbl_c, st_c, _ = cv2.connectedComponentsWithStats(cut)
                         parts = [
                             (lbl_c == cid).astype(np.uint8) * 255
@@ -455,11 +480,22 @@ def extract_blob_components(
                                 [int(np.count_nonzero(p)) for p in parts],
                                 reverse=True,
                             )
-                            if (areas[1] / max(areas[0], 1)) >= 0.12:
+                            side_dts = [float(dist[p > 0].max()) for p in parts]
+                            min_side_dt = min(side_dts) if side_dts else 0.0
+                            waist_ok = min_side_dt > 0.0 and (
+                                cut_max_dt <= 0.88 * min_side_dt
+                                or cut_max_dt <= 0.75 * max_dt
+                            )
+                            if waist_ok and (areas[1] / max(areas[0], 1)) >= 0.12:
                                 valid_parts = True
                                 for p in parts:
-                                    _, _, psol, _, par, has_c = compute_geometry_metrics(p)
-                                    if not has_c or psol < 0.75 or par > 1.65:
+                                    _, pcirc, psol, _, par, has_c = compute_geometry_metrics(p)
+                                    if (
+                                        not has_c
+                                        or pcirc < 0.75
+                                        or psol < 0.92
+                                        or par > 1.65
+                                    ):
                                         valid_parts = False
                                         break
                                 if valid_parts:
@@ -495,7 +531,19 @@ def extract_blob_components(
                                 if int(st_c[cid, cv2.CC_STAT_AREA]) >= min_area
                             ]
                             if len(parts) >= len(kept_defs):
-                                return parts
+                                valid_parts = True
+                                for p in parts:
+                                    _, pcirc, psol, _, par, has_c = compute_geometry_metrics(p)
+                                    if (
+                                        not has_c
+                                        or pcirc < 0.792
+                                        or psol < 0.965
+                                        or par > 1.65
+                                    ):
+                                        valid_parts = False
+                                        break
+                                if valid_parts:
+                                    return parts
 
     if len(dt_parts) >= 2:
         return dt_parts

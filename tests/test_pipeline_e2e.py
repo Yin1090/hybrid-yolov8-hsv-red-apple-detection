@@ -350,3 +350,47 @@ def test_e2e_voids_rejected_and_extended_clusters_preserved_across_modes() -> No
             res = HybridAppleDetector(PipelineConfig(mode=mode, yolo_conf=0.65)).process_frame(img)
             assert len(res.detections) == expected, f"{name} failed in {mode}: got {len(res.detections)}"
 
+
+def test_e2e_leaf_occluded_singles_and_thick_rings_across_modes() -> None:
+    import math
+
+    def _bg() -> np.ndarray:
+        return np.full((480, 640, 3), (75, 110, 80), dtype=np.uint8)
+
+    # Apple_3leaf (14x7, 16x8) -> 1 across hybrid/hsv/auto
+    for lx, ly in [(14, 7), (16, 8)]:
+        im_3l = _bg()
+        cv2.circle(im_3l, (320, 240), 36, (18, 20, 205), -1)
+        for deg in (30, 150, 270):
+            cx = int(round(320 + 34 * math.cos(math.radians(deg))))
+            cy = int(round(240 + 34 * math.sin(math.radians(deg))))
+            cv2.ellipse(im_3l, (cx, cy), (lx, ly), deg + 90, 0, 360, (35, 130, 45), -1)
+        for mode in ("hybrid", "hsv", "auto"):
+            for conf in (0.65, 0.15):
+                res = HybridAppleDetector(PipelineConfig(mode=mode, yolo_conf=conf)).process_frame(im_3l)
+                assert len(res.detections) == 1, f"Apple_3leaf_{lx}x{ly} failed in {mode}@{conf}: {len(res.detections)}"
+
+    # EllipApple_2leaf (35x30, 38x28, 42x28, 45x26 at 0 & 45 deg) -> 1 across hybrid/hsv/auto
+    for rx, ry in [(35, 30), (38, 28), (42, 28), (45, 26)]:
+        for ang in (0, 45):
+            im_el = _bg()
+            cv2.ellipse(im_el, (320, 240), (rx, ry), ang, 0, 360, (18, 20, 205), -1)
+            sa, ca = math.sin(math.radians(ang)), math.cos(math.radians(ang))
+            for sgn in (-1, 1):
+                lx = int(round(320 - sgn * (ry - 2) * sa))
+                ly = int(round(240 + sgn * (ry - 2) * ca))
+                cv2.ellipse(im_el, (lx, ly), (12, 6), ang, 0, 360, (35, 130, 45), -1)
+            for mode in ("hybrid", "hsv", "auto"):
+                for conf in (0.65, 0.15):
+                    res = HybridAppleDetector(PipelineConfig(mode=mode, yolo_conf=conf)).process_frame(im_el)
+                    assert len(res.detections) == 1, f"Ellip_{rx}x{ry}_a{ang}_2leaf failed in {mode}@{conf}: {len(res.detections)}"
+
+    # Thick rings Ring_r70_t58..62, Ring_r60_t48, Ring_r80_t65 -> 0 across hybrid@0.65/0.15, hsv@0.65, auto@0.65
+    for r, t in [(70, 58), (70, 60), (70, 62), (60, 48), (80, 65)]:
+        im_ring = _bg()
+        cv2.circle(im_ring, (320, 240), r, (18, 20, 205), thickness=t)
+        for mode, conf in [("hybrid", 0.65), ("hybrid", 0.15), ("hsv", 0.65), ("auto", 0.65)]:
+            res = HybridAppleDetector(PipelineConfig(mode=mode, yolo_conf=conf)).process_frame(im_ring)
+            assert len(res.detections) == 0, f"Ring_r{r}_t{t} failed in {mode}@{conf}: {len(res.detections)}"
+
+
