@@ -73,6 +73,87 @@ def build_split_red_mask(
     return mask
 
 
+def restore_specular_glare_holes(mask: np.ndarray, roi_bgr: np.ndarray) -> np.ndarray:
+    """Fill strictly enclosed low-saturation bright specular glare holes inside apple contours."""
+    if (
+        mask.size == 0
+        or roi_bgr.size == 0
+        or mask.shape[:2] != roi_bgr.shape[:2]
+        or np.count_nonzero(mask) == 0
+    ):
+        return mask
+
+    contours = _find_external_contours(mask)
+    if not contours:
+        return mask
+
+    h, w = mask.shape[:2]
+    out = mask.copy()
+    k_ext = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+    pad = 8
+
+    for cnt in contours:
+        outer_area = float(cv2.contourArea(cnt))
+        if outer_area < 120.0:
+            continue
+        bx, by, bw, bh = cv2.boundingRect(cnt)
+        if bw <= 0 or bh <= 0:
+            continue
+
+        x1 = max(0, bx - pad)
+        y1 = max(0, by - pad)
+        x2 = min(w, bx + bw + pad)
+        y2 = min(h, by + bh + pad)
+        if x2 <= x1 or y2 <= y1:
+            continue
+
+        sub_mask = mask[y1:y2, x1:x2]
+        cnt_fill = np.zeros_like(sub_mask)
+        cv2.drawContours(cnt_fill, [cnt - np.array([[x1, y1]])], -1, 255, -1)
+
+        holes_mask = ((cnt_fill > 0) & (sub_mask == 0)).astype(np.uint8) * 255
+        if np.count_nonzero(holes_mask) == 0:
+            continue
+
+        fg_pixels = (cnt_fill > 0) & (sub_mask > 0)
+        if not np.any(fg_pixels):
+            continue
+
+        sub_bgr = roi_bgr[y1:y2, x1:x2]
+        sub_hsv = cv2.cvtColor(sub_bgr, cv2.COLOR_BGR2HSV)
+        fg_s_med = float(np.median(sub_hsv[..., 1][fg_pixels]))
+        fg_v_med = float(np.median(sub_hsv[..., 2][fg_pixels]))
+
+        ext_collar = (cv2.dilate(cnt_fill, k_ext) > 0) & (cnt_fill == 0) & (sub_mask == 0)
+        has_ext = bool(np.any(ext_collar))
+        ext_bgr_med = (
+            np.median(sub_bgr[ext_collar].astype(np.float32), axis=0) if has_ext else None
+        )
+
+        s_thresh = min(65.0, max(35.0, 0.45 * fg_s_med))
+        v_thresh = min(225.0, max(165.0, fg_v_med + 10.0))
+
+        n_h, lbl_h, st_h, _ = cv2.connectedComponentsWithStats(holes_mask)
+        sub_out = out[y1:y2, x1:x2]
+        for hid in range(1, n_h):
+            h_area = float(st_h[hid, cv2.CC_STAT_AREA])
+            h_ratio = h_area / outer_area
+            if h_ratio >= 0.25:
+                continue
+            hm = lbl_h == hid
+            h_s = float(np.median(sub_hsv[..., 1][hm]))
+            h_v = float(np.median(sub_hsv[..., 2][hm]))
+            if h_s > s_thresh or h_v < v_thresh:
+                continue
+            if has_ext and ext_bgr_med is not None and (h_ratio >= 0.10 or h_area >= 1000.0):
+                h_bgr_med = np.median(sub_bgr[hm].astype(np.float32), axis=0)
+                if float(np.linalg.norm(h_bgr_med - ext_bgr_med)) < 28.0:
+                    continue
+            sub_out[hm] = 255
+
+    return out
+
+
 def compute_geometry_metrics(mask: np.ndarray) -> tuple[float, float, float, float, float, bool]:
     """Compute (red_ratio, circularity, solidity, extent, aspect_ratio, has_contour)."""
     total_pixels = float(mask.shape[0] * mask.shape[1])
@@ -204,7 +285,7 @@ def is_annular_or_ribbon_void(
     hull_area = float(cv2.contourArea(cv2.convexHull(cnt)))
     fg_solidity = (fg_area / hull_area) if hull_area > 0.0 else 0.0
     hole_ratio = 1.0 - (fg_area / outer_area)
-    if fg_solidity >= 0.78 and hole_ratio < 0.04:
+    if fg_solidity >= 0.78 and hole_ratio < 0.025:
         return False
 
     dist = _padded_distance_transform(sub_fg)
@@ -225,7 +306,106 @@ def is_annular_or_ribbon_void(
         except cv2.error:
             max_defect = 0.0
     defect_ratio = max_defect / minor_span
+    if fg_solidity >= 0.85 and hole_ratio < 0.06 and defect_ratio >= 0.06:
+        return False
     return (thick_ratio < 0.48) or (defect_ratio > 0.46 and thick_ratio < 0.55)
+
+
+def _is_valid_two_apple_split(
+    sub_fg: np.ndarray,
+    dist: np.ndarray,
+    cnt: np.ndarray,
+    parts: list[np.ndarray],
+    major: float,
+    thick_ratio: float,
+    max_dt: float,
+) -> bool:
+    """Validate that a 2-part split matches two overlapping disks rather than one occluded ellipse."""
+    if len(parts) != 2:
+        return True
+
+    fg_bool = sub_fg > 0
+    u_mask = np.zeros_like(sub_fg)
+    for part in parts:
+        masked_dist = np.where(part > 0, dist, -1.0)
+        py, px = np.unravel_index(int(np.argmax(masked_dist)), dist.shape)
+        rad = max(1, int(round(float(dist[py, px]))))
+        cv2.circle(u_mask, (int(px), int(py)), rad, 255, -1)
+
+    u_bool = u_mask > 0
+    union_px = int(np.count_nonzero(fg_bool | u_bool))
+    if union_px <= 0:
+        return False
+    two_c_iou = float(np.count_nonzero(fg_bool & u_bool)) / float(union_px)
+    if two_c_iou >= 0.932:
+        return True
+    if two_c_iou < 0.895 or thick_ratio < 0.925:
+        return False
+
+    el_iou = 0.0
+    has_el = False
+    hull = cv2.convexHull(cnt)
+    if len(hull) >= 5:
+        try:
+            ellipse = cv2.fitEllipse(hull)
+        except cv2.error:
+            ellipse = None
+        if ellipse is not None:
+            el_mask = np.zeros_like(sub_fg)
+            cv2.ellipse(el_mask, ellipse, 255, -1)
+            el_bool = el_mask > 0
+            el_union = int(np.count_nonzero(fg_bool | el_bool))
+            el_iou = (
+                (float(np.count_nonzero(fg_bool & el_bool)) / float(el_union))
+                if el_union > 0
+                else 0.0
+            )
+            has_el = True
+
+    if two_c_iou >= 0.914:
+        if thick_ratio < 0.925:
+            return False
+        if has_el and two_c_iou < el_iou - 0.035:
+            return False
+    else:
+        if thick_ratio < 0.965 or not has_el or two_c_iou <= el_iou:
+            return False
+
+    hull_idx = cv2.convexHull(cnt, returnPoints=False)
+    if hull_idx is not None and len(hull_idx) > 3 and len(cnt) > 3:
+        try:
+            defects = cv2.convexityDefects(cnt, hull_idx)
+        except cv2.error:
+            defects = None
+        if defects is not None and defects.size > 0:
+            d_arr = defects.reshape(-1, 4)
+            min_depth = max(5.5, 0.095 * max_dt)
+            cand_defs: list[tuple[float, float, tuple[int, int]]] = []
+            for s_idx, e_idx, f_idx, depth_q8 in d_arr:
+                depth = float(depth_q8) / 256.0
+                if depth < min_depth:
+                    continue
+                sx, sy = int(cnt[s_idx][0][0]), int(cnt[s_idx][0][1])
+                ex, ey = int(cnt[e_idx][0][0]), int(cnt[e_idx][0][1])
+                fx, fy = int(cnt[f_idx][0][0]), int(cnt[f_idx][0][1])
+                span = math.hypot(ex - sx, ey - sy)
+                cand_defs.append((depth, span, (fx, fy)))
+            cand_defs.sort(key=lambda item: item[0], reverse=True)
+            kept: list[tuple[float, float, tuple[int, int]]] = []
+            for depth, span, pt in cand_defs:
+                if all(
+                    math.hypot(pt[0] - kpt[0], pt[1] - kpt[1]) >= 0.60 * max_dt
+                    for _, _, kpt in kept
+                ):
+                    kept.append((depth, span, pt))
+            if len(kept) >= 2:
+                top2 = kept[:2]
+                d_avg = 0.5 * (top2[0][0] + top2[1][0])
+                sp_avg = 0.5 * (top2[0][1] + top2[1][1])
+                if (sp_avg / max(major, 1.0)) < 0.37 or (d_avg / max(sp_avg, 1e-6)) > 0.19:
+                    return False
+
+    return True
 
 
 def extract_blob_components(
@@ -257,6 +437,46 @@ def extract_blob_components(
     hull_area = float(cv2.contourArea(cv2.convexHull(cnt)))
     solidity = (area / hull_area) if hull_area > 0.0 else 0.0
     thick_ratio = (2.0 * max_dt) / minor
+    fg_area = float(np.count_nonzero(sub_fg))
+    hole_ratio = (1.0 - (fg_area / area)) if area > 0.0 else 0.0
+
+    kept_defs: list[tuple[int, int]] = []
+    if max_dt >= 8.0 and (major / (2.0 * max_dt)) >= 1.08 and solidity >= 0.78:
+        hull_idx = cv2.convexHull(cnt, returnPoints=False)
+        if hull_idx is not None and len(hull_idx) > 3 and len(cnt) > 3:
+            try:
+                defects = cv2.convexityDefects(cnt, hull_idx)
+            except cv2.error:
+                defects = None
+            if defects is not None and defects.size > 0:
+                d_arr = defects.reshape(-1, 4)
+                min_depth = max(5.5, 0.095 * max_dt)
+                cand_defs = sorted(
+                    [
+                        (float(d) / 256.0, (int(cnt[f][0][0]), int(cnt[f][0][1])))
+                        for _, _, f, d in d_arr
+                        if (float(d) / 256.0) >= min_depth
+                    ],
+                    reverse=True,
+                )
+                for _, pt in cand_defs:
+                    if all(
+                        math.hypot(pt[0] - kp[0], pt[1] - kp[1]) >= 0.60 * max_dt
+                        for kp in kept_defs
+                    ):
+                        kept_defs.append(pt)
+
+    if hole_ratio > 0.005 and solidity >= 0.94 and len(kept_defs) < 2:
+        cnt_fill = np.zeros_like(sub_fg)
+        cv2.drawContours(cnt_fill, [cnt], -1, 255, -1)
+        f_dist = _padded_distance_transform(cnt_fill)
+        f_dist_s = cv2.GaussianBlur(f_dist, (3, 3), 0)
+        f_dil = cv2.dilate(f_dist_s, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11)))
+        fn_pk, _, _, _ = cv2.connectedComponentsWithStats(
+            ((f_dist_s >= f_dil - 1e-5) & (f_dist_s >= 4.0) & (cnt_fill > 0)).astype(np.uint8)
+        )
+        if fn_pk <= 2:
+            return [sub_fg]
 
     dist_s = cv2.GaussianBlur(dist, (3, 3), 0)
     dil = cv2.dilate(dist_s, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11)))
@@ -410,140 +630,124 @@ def extract_blob_components(
                     part = np.zeros_like(sub_fg)
                     part[ys[sel], xs[sel]] = 255
                     parts.append(part)
-                if len(parts) == 2 and thick_ratio < 0.93 and solidity < 0.94:
+                if len(parts) == 2 and (
+                    thick_ratio < 0.925
+                    or not _is_valid_two_apple_split(
+                        sub_fg, dist, cnt, parts, major, thick_ratio, max_dt
+                    )
+                ):
                     parts = []
                 if len(parts) >= 2:
                     dt_parts = parts
 
     # Convexity-defect pinch splitting when heavy closing merges DT peaks or misses a lobe
-    if max_dt >= 8.0:
-        if (major / (2.0 * max_dt)) >= 1.08 and solidity >= 0.78:
-            hull_idx = cv2.convexHull(cnt, returnPoints=False)
-            if hull_idx is not None and len(hull_idx) > 3 and len(cnt) > 3:
-                try:
-                    defects = cv2.convexityDefects(cnt, hull_idx)
-                except cv2.error:
-                    defects = None
-                if defects is not None and defects.size > 0:
-                    d_arr = defects.reshape(-1, 4)
-                    min_depth = max(5.5, 0.11 * max_dt)
-                    cand_defs = sorted(
-                        [
-                            (float(d) / 256.0, (int(cnt[f][0][0]), int(cnt[f][0][1])))
-                            for _, _, f, d in d_arr
-                            if (float(d) / 256.0) >= min_depth
-                        ],
-                        reverse=True,
-                    )
-                    kept_defs: list[tuple[int, int]] = []
-                    for _, pt in cand_defs:
-                        if all(
-                            math.hypot(pt[0] - kp[0], pt[1] - kp[1]) >= 0.7 * max_dt
-                            for kp in kept_defs
+    if kept_defs:
+        if (
+            len(dt_parts) < 2
+            and len(kept_defs) == 2
+            and thick_ratio >= 0.925
+            and (major / (2.0 * max_dt)) >= 1.25
+            and (major / minor) >= 1.22
+            and math.hypot(
+                kept_defs[0][0] - kept_defs[1][0],
+                kept_defs[0][1] - kept_defs[1][1],
+            )
+            <= 1.85 * max_dt
+        ):
+            p0, p1 = kept_defs
+            n_samp = max(
+                16, int(math.ceil(math.hypot(p1[0] - p0[0], p1[1] - p0[1]))) + 1
+            )
+            cxs = np.clip(
+                np.round(np.linspace(p0[0], p1[0], n_samp)).astype(int), 0, cw - 1
+            )
+            cys = np.clip(
+                np.round(np.linspace(p0[1], p1[1], n_samp)).astype(int), 0, ch - 1
+            )
+            cut_max_dt = float(np.max(dist[cys, cxs]))
+
+            cut = sub_fg.copy()
+            cv2.line(cut, p0, p1, 0, 2)
+            n_c, lbl_c, st_c, _ = cv2.connectedComponentsWithStats(cut)
+            parts = [
+                (lbl_c == cid).astype(np.uint8) * 255
+                for cid in range(1, n_c)
+                if int(st_c[cid, cv2.CC_STAT_AREA]) >= min_area
+            ]
+            if len(parts) >= 2:
+                areas = sorted(
+                    [int(np.count_nonzero(p)) for p in parts],
+                    reverse=True,
+                )
+                side_dts = [float(dist[p > 0].max()) for p in parts]
+                min_side_dt = min(side_dts) if side_dts else 0.0
+                waist_ok = min_side_dt > 0.0 and (
+                    (min_side_dt >= 0.85 * max_dt and cut_max_dt <= 0.925 * min_side_dt)
+                    or (cut_max_dt <= 0.82 * min_side_dt)
+                    or (cut_max_dt <= 0.75 * max_dt)
+                )
+                if waist_ok and (areas[1] / max(areas[0], 1)) >= 0.12:
+                    valid_parts = True
+                    for p in parts:
+                        _, pcirc, psol, _, par, has_c = compute_geometry_metrics(p)
+                        if (
+                            not has_c
+                            or pcirc < 0.72
+                            or psol < 0.92
+                            or par > 1.65
                         ):
-                            kept_defs.append(pt)
-
-                    if (
-                        len(dt_parts) < 2
-                        and len(kept_defs) == 2
-                        and (thick_ratio >= 0.93 or solidity >= 0.945)
-                        and (major / (2.0 * max_dt)) >= 1.28
-                        and (major / minor) >= 1.25
-                        and math.hypot(
-                            kept_defs[0][0] - kept_defs[1][0],
-                            kept_defs[0][1] - kept_defs[1][1],
-                        )
-                        <= 1.85 * max_dt
-                    ):
-                        p0, p1 = kept_defs
-                        n_samp = max(
-                            16, int(math.ceil(math.hypot(p1[0] - p0[0], p1[1] - p0[1]))) + 1
-                        )
-                        cxs = np.clip(
-                            np.round(np.linspace(p0[0], p1[0], n_samp)).astype(int), 0, cw - 1
-                        )
-                        cys = np.clip(
-                            np.round(np.linspace(p0[1], p1[1], n_samp)).astype(int), 0, ch - 1
-                        )
-                        cut_max_dt = float(np.max(dist[cys, cxs]))
-
-                        cut = sub_fg.copy()
-                        cv2.line(cut, p0, p1, 0, 2)
-                        n_c, lbl_c, st_c, _ = cv2.connectedComponentsWithStats(cut)
-                        parts = [
-                            (lbl_c == cid).astype(np.uint8) * 255
-                            for cid in range(1, n_c)
-                            if int(st_c[cid, cv2.CC_STAT_AREA]) >= min_area
-                        ]
-                        if len(parts) >= 2:
-                            areas = sorted(
-                                [int(np.count_nonzero(p)) for p in parts],
-                                reverse=True,
-                            )
-                            side_dts = [float(dist[p > 0].max()) for p in parts]
-                            min_side_dt = min(side_dts) if side_dts else 0.0
-                            waist_ok = min_side_dt > 0.0 and (
-                                cut_max_dt <= 0.88 * min_side_dt
-                                or cut_max_dt <= 0.75 * max_dt
-                            )
-                            if waist_ok and (areas[1] / max(areas[0], 1)) >= 0.12:
-                                valid_parts = True
-                                for p in parts:
-                                    _, pcirc, psol, _, par, has_c = compute_geometry_metrics(p)
-                                    if (
-                                        not has_c
-                                        or pcirc < 0.75
-                                        or psol < 0.92
-                                        or par > 1.65
-                                    ):
-                                        valid_parts = False
-                                        break
-                                if valid_parts:
-                                    return parts
-                    elif len(kept_defs) >= 3 and (
-                        len(dt_parts) < 2
-                        or (
-                            len(kept_defs) > len(dt_parts)
-                            and (major / minor) < 1.65
-                            and bool(kept_heights)
-                            and max_dt >= 1.12 * min(kept_heights)
+                            valid_parts = False
+                            break
+                    if valid_parts and (
+                        len(parts) != 2
+                        or _is_valid_two_apple_split(
+                            sub_fg, dist, cnt, parts, major, thick_ratio, max_dt
                         )
                     ):
-                        my, mx = np.unravel_index(int(np.argmax(dist)), dist.shape)
-                        center = (int(mx), int(my))
-                        angs = sorted(
-                            [
-                                math.atan2(pt[1] - center[1], pt[0] - center[0])
-                                for pt in kept_defs
-                            ]
-                        )
-                        gaps = [
-                            angs[i + 1] - angs[i] for i in range(len(angs) - 1)
-                        ] + [2.0 * math.pi - (angs[-1] - angs[0])]
-                        if max(gaps) < math.radians(190.0):
-                            cut = sub_fg.copy()
-                            for pt in kept_defs:
-                                cv2.line(cut, center, pt, 0, 2)
-                            n_c, lbl_c, st_c, _ = cv2.connectedComponentsWithStats(cut)
-                            parts = [
-                                (lbl_c == cid).astype(np.uint8) * 255
-                                for cid in range(1, n_c)
-                                if int(st_c[cid, cv2.CC_STAT_AREA]) >= min_area
-                            ]
-                            if len(parts) >= len(kept_defs):
-                                valid_parts = True
-                                for p in parts:
-                                    _, pcirc, psol, _, par, has_c = compute_geometry_metrics(p)
-                                    if (
-                                        not has_c
-                                        or pcirc < 0.792
-                                        or psol < 0.965
-                                        or par > 1.65
-                                    ):
-                                        valid_parts = False
-                                        break
-                                if valid_parts:
-                                    return parts
+                        return parts
+        elif len(kept_defs) >= 3 and (
+            len(dt_parts) < 2
+            or (
+                len(kept_defs) > len(dt_parts)
+                and (major / minor) < 1.65
+                and bool(kept_heights)
+                and max_dt >= 1.12 * min(kept_heights)
+            )
+        ):
+            my, mx = np.unravel_index(int(np.argmax(dist)), dist.shape)
+            center = (int(mx), int(my))
+            angs = sorted(
+                [
+                    math.atan2(pt[1] - center[1], pt[0] - center[0])
+                    for pt in kept_defs
+                ]
+            )
+            gaps = [
+                angs[i + 1] - angs[i] for i in range(len(angs) - 1)
+            ] + [2.0 * math.pi - (angs[-1] - angs[0])]
+            if max(gaps) < math.radians(190.0):
+                cut = sub_fg.copy()
+                for pt in kept_defs:
+                    cv2.line(cut, center, pt, 0, 2)
+                n_c, lbl_c, st_c, _ = cv2.connectedComponentsWithStats(cut)
+                parts = [
+                    (lbl_c == cid).astype(np.uint8) * 255
+                    for cid in range(1, n_c)
+                    if int(st_c[cid, cv2.CC_STAT_AREA]) >= min_area
+                ]
+                if len(parts) >= len(kept_defs):
+                    p_metrics = [compute_geometry_metrics(p) for p in parts]
+                    base_ok = all(
+                        has_c and pcirc >= 0.735 and psol >= 0.93 and par <= 1.65
+                        for _, pcirc, psol, _, par, has_c in p_metrics
+                    )
+                    strict_cnt = sum(
+                        1
+                        for _, pcirc, psol, _, par, has_c in p_metrics
+                        if has_c and pcirc >= 0.792 and psol >= 0.965 and par <= 1.65
+                    )
+                    if base_ok and strict_cnt >= len(parts) - 1:
+                        return parts
 
     if len(dt_parts) >= 2:
         return dt_parts
@@ -737,6 +941,8 @@ def refine_candidate(
         open_iter=cfg.open_iter,
         close_iter=cfg.close_iter,
     )
+    if cfg.close_iter > 0:
+        mask = restore_specular_glare_holes(mask, roi)
     red_ratio, circularity, solidity, extent, aspect_ratio, has_contour = compute_geometry_metrics(mask)
     passed, reject_reason = _check_admissibility(
         red_ratio, circularity, solidity, extent, aspect_ratio, has_contour, cfg
@@ -799,6 +1005,8 @@ def detect_in_rect(
         open_iter=cfg.open_iter,
         close_iter=cfg.close_iter,
     )
+    if cfg.close_iter > 0:
+        mask = restore_specular_glare_holes(mask, roi)
 
     contours = _find_external_contours(mask)
     results: list[RefinementResult] = []
@@ -903,6 +1111,8 @@ def segment_full_frame_hsv(
         open_iter=cfg.open_iter,
         close_iter=cfg.close_iter,
     )
+    if cfg.close_iter > 0:
+        roi_mask = restore_specular_glare_holes(roi_mask, roi)
     if active_roi is None:
         return roi_mask
 

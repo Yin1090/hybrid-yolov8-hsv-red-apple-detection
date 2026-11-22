@@ -8,7 +8,7 @@ from typing import Any, Protocol
 import cv2
 import numpy as np
 
-from .refinement import extract_blob_components
+from .refinement import extract_blob_components, restore_specular_glare_holes
 from .types import DetectionCandidate
 
 
@@ -355,6 +355,7 @@ class CalibratedProposerBackend:
         k_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
         fg = cv2.morphologyEx(fg, cv2.MORPH_CLOSE, k_close, iterations=1)
         fg = cv2.morphologyEx(fg, cv2.MORPH_OPEN, k_open, iterations=1)
+        fg = restore_specular_glare_holes(fg, frame_bgr)
 
         num_cc, cc_labels, cc_stats, _ = cv2.connectedComponentsWithStats(fg)
         gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)

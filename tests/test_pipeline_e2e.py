@@ -394,3 +394,143 @@ def test_e2e_leaf_occluded_singles_and_thick_rings_across_modes() -> None:
             assert len(res.detections) == 0, f"Ring_r{r}_t{t} failed in {mode}@{conf}: {len(res.detections)}"
 
 
+def test_e2e_iteration6_glare_rings_offcenter_ellipses_and_clusters_across_modes() -> None:
+    import math
+
+    def _bg(color: tuple[int, int, int] = (75, 110, 80)) -> np.ndarray:
+        return np.full((480, 640, 3), color, dtype=np.uint8)
+
+    def _draw_shaded(img: np.ndarray, cx: int, cy: int, r: int, floor: float = 0.0) -> None:
+        y0, y1 = max(0, cy - r - 2), min(img.shape[0], cy + r + 3)
+        x0, x1 = max(0, cx - r - 2), min(img.shape[1], cx + r + 3)
+        yy, xx = np.ogrid[y0:y1, x0:x1]
+        dx = (xx - cx) / float(r)
+        dy = (yy - cy) / float(r)
+        d2 = dx * dx + dy * dy
+        m = d2 <= 1.0
+        nz = np.sqrt(np.clip(1.0 - d2, 0.0, 1.0))
+        ndotl = np.clip(-0.45 * dx - 0.45 * dy + 0.77 * nz, floor, 1.0)
+        patch = img[y0:y1, x0:x1].astype(np.float32)
+        for c_i, b in enumerate((18, 20, 205)):
+            patch[..., c_i] = np.where(
+                m, np.clip(b * (0.52 + 0.58 * ndotl), 0.0, 255.0), patch[..., c_i]
+            )
+        img[y0:y1, x0:x1] = patch.astype(np.uint8)
+
+    cases: list[tuple[str, np.ndarray, int]] = []
+
+    # 1. Unequal pairs (20,40,48), (16,38,48) -> 2
+    for r1, r2, d in [(20, 40, 48), (16, 38, 48)]:
+        im = _bg()
+        cv2.circle(im, (320 - d // 2, 240), r1, (18, 20, 205), -1)
+        cv2.circle(im, (320 + d // 2, 240), r2, (18, 20, 205), -1)
+        cases.append((f"Unequal_{r1}_{r2}_d{d}", im, 2))
+
+    # 2. Deep2H_d44_1leaf(12,6), 2H_r35_d52_1leaf_mid, 2Ellip35x30_d54 -> 2
+    im_d2 = _bg()
+    cv2.circle(im_d2, (298, 240), 35, (18, 20, 205), -1)
+    cv2.circle(im_d2, (342, 240), 35, (18, 20, 205), -1)
+    cv2.ellipse(im_d2, (320, 207), (12, 6), 0, 0, 360, (35, 130, 45), -1)
+    cases.append(("Deep2H_d44_leaf12x6", im_d2, 2))
+
+    im_mid = _bg()
+    cv2.circle(im_mid, (294, 240), 35, (18, 20, 205), -1)
+    cv2.circle(im_mid, (346, 240), 35, (18, 20, 205), -1)
+    cv2.ellipse(im_mid, (320, 210), (10, 5), 0, 0, 360, (35, 130, 45), -1)
+    cases.append(("2H_r35_d52_1leaf_mid", im_mid, 2))
+
+    im_2el = _bg()
+    cv2.ellipse(im_2el, (293, 240), (35, 30), 0, 0, 360, (18, 20, 205), -1)
+    cv2.ellipse(im_2el, (347, 240), (35, 30), 0, 0, 360, (18, 20, 205), -1)
+    cases.append(("2Ellip35x30_d54", im_2el, 2))
+
+    # 3. 3T_rot30_1small_leaf(12,6) -> 3, 4Diam_d46_r35 -> 4, 5Pent(floor=0.0) -> 5
+    im_3t = _bg()
+    rad = 48.0 / math.sqrt(3.0)
+    for k in range(3):
+        th = math.radians(30 + 120 * k - 90)
+        cv2.circle(im_3t, (int(round(320 + rad * math.cos(th))), int(round(240 + rad * math.sin(th)))), 35, (18, 20, 205), -1)
+    th0 = math.radians(30 - 90)
+    cv2.ellipse(
+        im_3t,
+        (int(round(320 + (rad + 33) * math.cos(th0))), int(round(240 + (rad + 33) * math.sin(th0)))),
+        (12, 6),
+        30,
+        0,
+        360,
+        (35, 130, 45),
+        -1,
+    )
+    cases.append(("3T_rot30_1leaf_12x6", im_3t, 3))
+
+    im_4d = _bg()
+    off = int(round(46.0 / math.sqrt(2.0)))
+    for cx, cy in [(320, 240 - off), (320 + off, 240), (320, 240 + off), (320 - off, 240)]:
+        cv2.circle(im_4d, (cx, cy), 35, (18, 20, 205), -1)
+    cases.append(("4Diam_d46_r35", im_4d, 4))
+
+    im_5p = _bg()
+    rad5 = 54.0 / (2.0 * math.sin(math.pi / 5.0))
+    for k in range(5):
+        th = math.radians(72 * k - 90)
+        _draw_shaded(im_5p, int(round(320 + rad5 * math.cos(th))), int(round(240 + rad5 * math.sin(th))), 32, floor=0.0)
+    cases.append(("5Pent_floor0", im_5p, 5))
+
+    # 4. Off-center EllipApple_2leaf & 1-leaf -> 1
+    for rx, ry, sh_off, lx, ly, ang in [
+        (45, 26, 12, 12, 6, 0),
+        (45, 26, 16, 14, 7, 30),
+        (42, 28, 16, 12, 6, 90),
+        (38, 28, 0, 8, 4, 0),
+    ]:
+        im_el = _bg()
+        cv2.ellipse(im_el, (320, 240), (rx, ry), ang, 0, 360, (18, 20, 205), -1)
+        ca, sa = math.cos(math.radians(ang)), math.sin(math.radians(ang))
+        for sgn in (-1, 1):
+            cx = int(round(320 + sh_off * ca - sgn * (ry - 2) * sa))
+            cy = int(round(240 + sh_off * sa + sgn * (ry - 2) * ca))
+            cv2.ellipse(im_el, (cx, cy), (lx, ly), ang, 0, 360, (35, 130, 45), -1)
+        cases.append((f"Ellip_{rx}x{ry}_sh{sh_off}_{lx}x{ly}_a{ang}", im_el, 1))
+
+    im_el1 = _bg()
+    cv2.ellipse(im_el1, (320, 240), (45, 26), 0, 0, 360, (18, 20, 205), -1)
+    cv2.ellipse(im_el1, (320, 264), (12, 6), 0, 0, 360, (35, 130, 45), -1)
+    cases.append(("Ellip1L_45x26", im_el1, 1))
+
+    # 5. Glare singles & clusters -> 1 / 2 / 3
+    for r, g in [(36, 10), (45, 10), (55, 12)]:
+        im_g = _bg()
+        cv2.circle(im_g, (320, 240), r, (18, 20, 205), -1)
+        cv2.circle(im_g, (320, 240), g, (245, 245, 245), -1)
+        cases.append((f"Apple_r{r}_glare{g}", im_g, 1))
+
+    im_2g = _bg()
+    cv2.circle(im_2g, (293, 240), 35, (18, 20, 205), -1)
+    cv2.circle(im_2g, (347, 240), 35, (18, 20, 205), -1)
+    cv2.circle(im_2g, (293, 240), 10, (245, 245, 245), -1)
+    cases.append(("2H_glare10", im_2g, 2))
+
+    im_3g = _bg()
+    rad_g = 52.0 / math.sqrt(3.0)
+    for k in range(3):
+        th = math.radians(120 * k - 90)
+        cv2.circle(im_3g, (int(round(320 + rad_g * math.cos(th))), int(round(240 + rad_g * math.sin(th)))), 35, (18, 20, 205), -1)
+    cv2.circle(im_3g, (320, int(round(240 - rad_g))), 10, (245, 245, 245), -1)
+    cases.append(("3T_glare10", im_3g, 3))
+
+    # 6. Ultra-thick rings on green/dark/white backgrounds -> 0
+    for bg_name, bg_c in [("green", (75, 110, 80)), ("dark", (30, 35, 30)), ("white", (245, 245, 245))]:
+        for r, t in [(60, 74), (70, 89)]:
+            im_r = _bg(bg_c)
+            cv2.circle(im_r, (320, 240), r, (18, 20, 205), thickness=t)
+            cases.append((f"Ring_r{r}_t{t}_{bg_name}", im_r, 0))
+
+    for name, img, expected in cases:
+        for mode, conf in [("hybrid", 0.65), ("hybrid", 0.15), ("hsv", 0.65), ("auto", 0.65)]:
+            res = HybridAppleDetector(PipelineConfig(mode=mode, yolo_conf=conf)).process_frame(img)
+            assert len(res.detections) == expected, (
+                f"{name} failed in {mode}@{conf}: got {len(res.detections)}, expected {expected}"
+            )
+
+
+

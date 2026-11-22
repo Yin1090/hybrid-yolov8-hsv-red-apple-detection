@@ -12,8 +12,11 @@ from hybrid_apple_detector.refinement import (
     build_split_red_mask,
     compute_geometry_metrics,
     detect_in_rect,
+    extract_blob_components,
+    is_annular_or_ribbon_void,
     preprocess_roi_hsv,
     refine_candidate,
+    restore_specular_glare_holes,
 )
 from hybrid_apple_detector.types import DetectionCandidate
 
@@ -388,4 +391,118 @@ def test_single_leaf_occluded_apples_thick_rings_and_sibling_net_area() -> None:
     assert has_sib is True
     assert circ_sib > 0.85
     assert sol_sib > 0.95
+
+
+def test_glare_hole_restoration_void_hardening_and_standalone_shatter_guard() -> None:
+    cfg = PipelineConfig()
+
+    # 1. Photometric glare restoration fills specular glare while preserving green leaf holes & white-bg rings
+    im_gl = np.full((240, 240, 3), (75, 110, 80), dtype=np.uint8)
+    cv2.circle(im_gl, (120, 120), 45, (18, 20, 205), -1)
+    cv2.circle(im_gl, (120, 120), 10, (245, 245, 245), -1)
+    holed_mask = np.zeros((240, 240), dtype=np.uint8)
+    cv2.circle(holed_mask, (120, 120), 45, 255, -1)
+    cv2.circle(holed_mask, (120, 120), 10, 0, -1)
+    restored = restore_specular_glare_holes(holed_mask, im_gl)
+    assert int(np.count_nonzero(restored)) > int(np.count_nonzero(holed_mask))
+    assert int(restored[120, 120]) == 255
+
+    im_leaf_hole = np.full((240, 240, 3), (75, 110, 80), dtype=np.uint8)
+    cv2.circle(im_leaf_hole, (120, 120), 45, (18, 20, 205), -1)
+    cv2.circle(im_leaf_hole, (120, 120), 12, (35, 130, 45), -1)
+    kept_leaf_hole = restore_specular_glare_holes(holed_mask, im_leaf_hole)
+    assert int(kept_leaf_hole[120, 120]) == 0
+
+    im_white_ring = np.full((300, 300, 3), (245, 245, 245), dtype=np.uint8)
+    cv2.circle(im_white_ring, (150, 150), 70, (18, 20, 205), thickness=89)
+    ring_mask = np.zeros((300, 300), dtype=np.uint8)
+    cv2.circle(ring_mask, (150, 150), 70, 255, thickness=89)
+    kept_ring = restore_specular_glare_holes(ring_mask, im_white_ring)
+    assert int(kept_ring[150, 150]) == 0
+    assert is_annular_or_ribbon_void(ring_mask) is True
+
+    # 2. Standalone extract_blob_components must not 6-way shatter a glare-holed apple mask
+    holed_120 = np.zeros((120, 120), dtype=np.uint8)
+    cv2.circle(holed_120, (60, 60), 45, 255, -1)
+    cv2.circle(holed_120, (60, 60), 10, 0, -1)
+    assert len(extract_blob_components(holed_120)) == 1
+
+    # 3. Glare singles/clusters and ultra-thick rings across backgrounds in detect_in_rect
+    for r, g in [(36, 10), (45, 10), (55, 12)]:
+        sc = np.full((480, 640, 3), (75, 110, 80), dtype=np.uint8)
+        cv2.circle(sc, (320, 240), r, (18, 20, 205), -1)
+        cv2.circle(sc, (320, 240), g, (245, 245, 245), -1)
+        refs, _ = detect_in_rect(sc, config=cfg)
+        assert len(refs) == 1
+
+    for bg_c in [(75, 110, 80), (30, 35, 30), (245, 245, 245)]:
+        for r, t in [(60, 74), (70, 89)]:
+            sc_r = np.full((480, 640, 3), bg_c, dtype=np.uint8)
+            cv2.circle(sc_r, (320, 240), r, (18, 20, 205), thickness=t)
+            refs_r, _ = detect_in_rect(sc_r, config=cfg)
+            assert len(refs_r) == 0
+
+
+def test_offcenter_ellipses_and_tight_occluded_clusters_refinement() -> None:
+    import math
+
+    cfg = PipelineConfig()
+
+    def _bg() -> np.ndarray:
+        return np.full((480, 640, 3), (75, 110, 80), dtype=np.uint8)
+
+    # Off-center 2-leaf & small-leaf/1-leaf elliptical singles -> 1
+    for rx, ry, sh_off, lx, ly, ang in [
+        (45, 26, 12, 12, 6, 0),
+        (45, 26, 16, 14, 7, 30),
+        (42, 28, 16, 12, 6, 90),
+        (38, 28, 0, 8, 4, 0),
+        (42, 28, 0, 8, 4, 45),
+    ]:
+        im_el = _bg()
+        cv2.ellipse(im_el, (320, 240), (rx, ry), ang, 0, 360, (18, 20, 205), -1)
+        ca, sa = math.cos(math.radians(ang)), math.sin(math.radians(ang))
+        for sgn in (-1, 1):
+            cx = int(round(320 + sh_off * ca - sgn * (ry - 2) * sa))
+            cy = int(round(240 + sh_off * sa + sgn * (ry - 2) * ca))
+            cv2.ellipse(im_el, (cx, cy), (lx, ly), ang, 0, 360, (35, 130, 45), -1)
+        refs_el, _ = detect_in_rect(im_el, config=cfg)
+        assert len(refs_el) == 1
+
+    # Unequal pairs, Deep2H with leaf, 2Ellip, 3T_rot30 with leaf, 4Diam_d46, 5Pent(floor=0.0)
+    im_u = _bg()
+    cv2.circle(im_u, (290, 240), 20, (18, 20, 205), -1)
+    cv2.circle(im_u, (338, 240), 40, (18, 20, 205), -1)
+    assert len(detect_in_rect(im_u, config=cfg)[0]) == 2
+
+    im_d2 = _bg()
+    cv2.circle(im_d2, (298, 240), 35, (18, 20, 205), -1)
+    cv2.circle(im_d2, (342, 240), 35, (18, 20, 205), -1)
+    cv2.ellipse(im_d2, (320, 207), (12, 6), 0, 0, 360, (35, 130, 45), -1)
+    assert len(detect_in_rect(im_d2, config=cfg)[0]) == 2
+
+    im_3t = _bg()
+    rad = 48.0 / math.sqrt(3.0)
+    for k in range(3):
+        th = math.radians(30 + 120 * k - 90)
+        cv2.circle(im_3t, (int(round(320 + rad * math.cos(th))), int(round(240 + rad * math.sin(th)))), 35, (18, 20, 205), -1)
+    th0 = math.radians(30 - 90)
+    cv2.ellipse(
+        im_3t,
+        (int(round(320 + (rad + 33) * math.cos(th0))), int(round(240 + (rad + 33) * math.sin(th0)))),
+        (12, 6),
+        30,
+        0,
+        360,
+        (35, 130, 45),
+        -1,
+    )
+    assert len(detect_in_rect(im_3t, config=cfg)[0]) == 3
+
+    im_4d = _bg()
+    off = int(round(46.0 / math.sqrt(2.0)))
+    for cx, cy in [(320, 240 - off), (320 + off, 240), (320, 240 + off), (320 - off, 240)]:
+        cv2.circle(im_4d, (cx, cy), 35, (18, 20, 205), -1)
+    assert len(detect_in_rect(im_4d, config=cfg)[0]) == 4
+
 
