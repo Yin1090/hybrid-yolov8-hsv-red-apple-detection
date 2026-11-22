@@ -91,7 +91,13 @@ def compute_geometry_metrics(mask: np.ndarray) -> tuple[float, float, float, flo
     circularity = (4.0 * math.pi * area / (perim * perim)) if perim > 0.0 else 0.0
     solidity = (area / hull_area) if hull_area > 0.0 else 0.0
     extent = area / rect_area
-    aspect_ratio = (float(bw) / float(bh)) if bh > 0 else 0.0
+    axis_ar = (float(bw) / float(bh)) if bh > 0 else 0.0
+    (_, _), (mw, mh), _ = cv2.minAreaRect(cnt)
+    ow = float(mw) + 1.0
+    oh = float(mh) + 1.0
+    oriented_ar = (max(ow, oh) / min(ow, oh)) if (ow > 0.0 and oh > 0.0) else axis_ar
+    axis_elongation = max(axis_ar, 1.0 / axis_ar) if axis_ar > 0.0 else 0.0
+    aspect_ratio = oriented_ar if oriented_ar > axis_elongation else axis_ar
     return red_ratio, circularity, solidity, extent, aspect_ratio, True
 
 
@@ -159,13 +165,17 @@ class AdaptiveHSVCalibrator:
         roi_half: int = ROI_HALF,
         clahe_clip_limit: float = 2.0,
         clahe_grid_size: tuple[int, int] = (8, 8),
-    ) -> Tuple[AdaptiveHSVProfile, tuple[int, int, int, int], list[str]]:
+    ) -> Tuple[AdaptiveHSVProfile, tuple[int, int, int, int] | None, list[str]]:
         """Sample a [cx-roi_half:cx+roi_half, cy-roi_half:cy+roi_half] patch and update HSV bounds."""
         h, w = frame_bgr.shape[:2]
-        x1 = max(0, int(cx) - int(roi_half))
-        y1 = max(0, int(cy) - int(roi_half))
-        x2 = min(w, int(cx) + int(roi_half))
-        y2 = min(h, int(cy) + int(roi_half))
+        icx = int(cx)
+        icy = int(cy)
+        if not (0 <= icx < w and 0 <= icy < h):
+            return self.profile, None, ["[ROI CLICK] ignored out-of-bounds"]
+        x1 = max(0, icx - int(roi_half))
+        y1 = max(0, icy - int(roi_half))
+        x2 = min(w, icx + int(roi_half))
+        y2 = min(h, icy + int(roi_half))
         return self.calibrate_from_rect(
             frame_bgr,
             (x1, y1, x2, y2),
@@ -179,13 +189,18 @@ class AdaptiveHSVCalibrator:
         rect: tuple[int, int, int, int],
         clahe_clip_limit: float = 2.0,
         clahe_grid_size: tuple[int, int] = (8, 8),
-    ) -> Tuple[AdaptiveHSVProfile, tuple[int, int, int, int], list[str]]:
+    ) -> Tuple[AdaptiveHSVProfile, tuple[int, int, int, int] | None, list[str]]:
         """Sample HSV pixels inside rect, adapt S/V via 20th/80th percentiles and H split ranges."""
         h, w = frame_bgr.shape[:2]
-        x1 = max(0, min(w - 1, int(rect[0])))
-        y1 = max(0, min(h - 1, int(rect[1])))
-        x2 = max(x1 + 1, min(w, int(rect[2])))
-        y2 = max(y1 + 1, min(h, int(rect[3])))
+        raw_x1, raw_y1, raw_x2, raw_y2 = int(rect[0]), int(rect[1]), int(rect[2]), int(rect[3])
+        if raw_x2 <= raw_x1 or raw_y2 <= raw_y1:
+            return self.profile, None, ["[ROI CLICK] ignored out-of-bounds"]
+        x1 = max(0, min(w, raw_x1))
+        y1 = max(0, min(h, raw_y1))
+        x2 = max(0, min(w, raw_x2))
+        y2 = max(0, min(h, raw_y2))
+        if x2 <= x1 or y2 <= y1:
+            return self.profile, None, ["[ROI CLICK] ignored out-of-bounds"]
 
         patch = frame_bgr[y1:y2, x1:x2]
         hsv_eq = preprocess_roi_hsv(
@@ -254,6 +269,21 @@ class AdaptiveHSVCalibrator:
         return self.profile, (x1, y1, x2, y2), logs
 
 
+def _empty_refinement(candidate: DetectionCandidate, reason: str) -> RefinementResult:
+    return RefinementResult(
+        candidate=candidate,
+        passed=False,
+        reject_reason=reason,
+        red_ratio=0.0,
+        circularity=0.0,
+        solidity=0.0,
+        extent=0.0,
+        aspect_ratio=0.0,
+        hsv_conf=0.0,
+        roi_mask=np.zeros((0, 0), dtype=np.uint8),
+    )
+
+
 def refine_candidate(
     frame_bgr: np.ndarray,
     candidate: DetectionCandidate,
@@ -266,10 +296,24 @@ def refine_candidate(
     h, w = frame_bgr.shape[:2]
 
     x1, y1, x2, y2 = candidate.bbox
-    cx1 = max(0, min(w - 1, int(x1)))
-    cy1 = max(0, min(h - 1, int(y1)))
-    cx2 = max(cx1 + 1, min(w, int(x2)))
-    cy2 = max(cy1 + 1, min(h, int(y2)))
+    if not (
+        math.isfinite(float(x1))
+        and math.isfinite(float(y1))
+        and math.isfinite(float(x2))
+        and math.isfinite(float(y2))
+    ):
+        return _empty_refinement(candidate, "invalid_bbox")
+
+    ix1, iy1, ix2, iy2 = int(x1), int(y1), int(x2), int(y2)
+    if ix2 <= ix1 or iy2 <= iy1:
+        return _empty_refinement(candidate, "invalid_roi")
+
+    cx1 = max(0, min(w, ix1))
+    cy1 = max(0, min(h, iy1))
+    cx2 = max(0, min(w, ix2))
+    cy2 = max(0, min(h, iy2))
+    if cx2 <= cx1 or cy2 <= cy1:
+        return _empty_refinement(candidate, "invalid_roi")
 
     roi = frame_bgr[cy1:cy2, cx1:cx2]
     hsv_eq = preprocess_roi_hsv(
@@ -320,10 +364,15 @@ def detect_in_rect(
     if rect is None:
         rx1, ry1, rx2, ry2 = 0, 0, w, h
     else:
-        rx1 = max(0, min(w - 1, int(rect[0])))
-        ry1 = max(0, min(h - 1, int(rect[1])))
-        rx2 = max(rx1 + 1, min(w, int(rect[2])))
-        ry2 = max(ry1 + 1, min(h, int(rect[3])))
+        raw_x1, raw_y1, raw_x2, raw_y2 = int(rect[0]), int(rect[1]), int(rect[2]), int(rect[3])
+        if raw_x2 <= raw_x1 or raw_y2 <= raw_y1:
+            return [], np.zeros((h, w), dtype=np.uint8)
+        rx1 = max(0, min(w, raw_x1))
+        ry1 = max(0, min(h, raw_y1))
+        rx2 = max(0, min(w, raw_x2))
+        ry2 = max(0, min(h, raw_y2))
+        if rx2 <= rx1 or ry2 <= ry1:
+            return [], np.zeros((h, w), dtype=np.uint8)
 
     roi = frame_bgr[ry1:ry2, rx1:rx2]
     hsv_eq = preprocess_roi_hsv(
@@ -400,10 +449,20 @@ def segment_full_frame_hsv(
     if active_roi is None:
         rx1, ry1, rx2, ry2 = 0, 0, w, h
     else:
-        rx1 = max(0, min(w - 1, int(active_roi[0])))
-        ry1 = max(0, min(h - 1, int(active_roi[1])))
-        rx2 = max(rx1 + 1, min(w, int(active_roi[2])))
-        ry2 = max(ry1 + 1, min(h, int(active_roi[3])))
+        raw_x1, raw_y1, raw_x2, raw_y2 = (
+            int(active_roi[0]),
+            int(active_roi[1]),
+            int(active_roi[2]),
+            int(active_roi[3]),
+        )
+        if raw_x2 <= raw_x1 or raw_y2 <= raw_y1:
+            return np.zeros((h, w), dtype=np.uint8)
+        rx1 = max(0, min(w, raw_x1))
+        ry1 = max(0, min(h, raw_y1))
+        rx2 = max(0, min(w, raw_x2))
+        ry2 = max(0, min(h, raw_y2))
+        if rx2 <= rx1 or ry2 <= ry1:
+            return np.zeros((h, w), dtype=np.uint8)
 
     roi = frame_bgr[ry1:ry2, rx1:rx2]
     hsv_eq = preprocess_roi_hsv(

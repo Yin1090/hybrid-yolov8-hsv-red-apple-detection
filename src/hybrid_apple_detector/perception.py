@@ -93,6 +93,7 @@ def decode_yolov8_output(
     nms_iou: float = 0.60,
     target_class_id: int | None = None,
     backend_name: str = "onnx",
+    channels_first: bool | None = None,
 ) -> list[DetectionCandidate]:
     """Decode YOLOv8 [1, 4+C, N] or [1, N, 4+C] predictions into DetectionCandidate boxes."""
     arr = np.asarray(output_tensor, dtype=np.float32)
@@ -102,14 +103,27 @@ def decode_yolov8_output(
         raise ValueError(f"Expected 2D or 3D YOLOv8 output tensor, got shape {output_tensor.shape}")
 
     # Normalize layout to (N_preds, 4 + C)
-    if arr.shape[0] < 5:
+    if channels_first is True:
+        preds = arr.T
+    elif channels_first is False:
         preds = arr
-    elif arr.shape[1] < 5:
-        preds = arr.T
-    elif arr.shape[0] < arr.shape[1] and arr.shape[0] <= 128:
-        preds = arr.T
     else:
-        preds = arr
+        if arr.shape[0] < 5 and arr.shape[1] not in (5, 84):
+            raise ValueError(
+                f"Expected at least 5 channels (cx,cy,w,h,cls...), got {arr.shape[0]}"
+            )
+        if arr.shape[1] < 5:
+            preds = arr.T
+        elif arr.shape[0] < 5:
+            preds = arr
+        elif arr.shape[0] in (5, 84) and arr.shape[1] not in (5, 84):
+            preds = arr.T
+        elif arr.shape[1] in (5, 84) and arr.shape[0] not in (5, 84):
+            preds = arr
+        elif arr.shape[0] < arr.shape[1] and arr.shape[0] <= 128:
+            preds = arr.T
+        else:
+            preds = arr
 
     if preds.shape[1] < 5:
         raise ValueError(f"Expected at least 5 channels (cx,cy,w,h,cls...), got {preds.shape[1]}")
@@ -121,8 +135,10 @@ def decode_yolov8_output(
     cls_scores = preds[:, 4:]
 
     if target_class_id is not None:
-        if target_class_id >= cls_scores.shape[1]:
-            raise ValueError(f"target_class_id={target_class_id} out of range for {cls_scores.shape[1]} classes")
+        if target_class_id < 0 or target_class_id >= cls_scores.shape[1]:
+            raise ValueError(
+                f"target_class_id={target_class_id} out of range for {cls_scores.shape[1]} classes"
+            )
         scores = cls_scores[:, target_class_id]
         cls_ids = np.full(len(scores), target_class_id, dtype=np.int64)
     else:
@@ -251,11 +267,13 @@ class ONNXRuntimeBackend:
         nms_iou: float = 0.60,
         target_class_id: int | None = None,
         session: Any | None = None,
+        channels_first: bool | None = None,
     ) -> None:
         self.weights_path = str(weights_path)
         self.input_size = int(input_size)
         self.nms_iou = float(nms_iou)
         self.target_class_id = target_class_id
+        self.channels_first = channels_first
         if session is not None:
             self._session = session
         else:
@@ -287,18 +305,78 @@ class ONNXRuntimeBackend:
             nms_iou=self.nms_iou,
             target_class_id=self.target_class_id,
             backend_name=self.name,
+            channels_first=self.channels_first,
         )
 
 
 class CalibratedProposerBackend:
     """Pure OpenCV + NumPy pixel-driven coarse region proposer (offline Layer 2 fallback).
 
-    Operates exclusively on raw BGR pixel statistics (warm chromatic prominence, gradient
-    contours, distance-transform watershed peak splitting, and local patch scoring).
+    Operates exclusively on raw BGR pixel statistics (warm chromatic prominence, auxiliary
+    CLAHE-V / luminance-normalized dark-shadow red contrast, gradient contours,
+    saddle-pinch-gated distance-transform peak splitting, and local patch scoring).
     Zero filename inspection or external ground-truth data is ever used.
     """
 
     name: str = "calibrated"
+
+    @staticmethod
+    def _group_pinched_peaks(
+        sub_fg: np.ndarray,
+        dist_s: np.ndarray,
+        cents: np.ndarray,
+        pinch_ratio: float = 0.78,
+    ) -> list[int]:
+        """Merge candidate peaks that are not separated by a genuine narrow saddle/pinch valley."""
+        k_count = len(cents)
+        parent = list(range(k_count))
+
+        def _find(u: int) -> int:
+            while parent[u] != u:
+                parent[u] = parent[parent[u]]
+                u = parent[u]
+            return u
+
+        def _union(u: int, v: int) -> None:
+            ru, rv = _find(u), _find(v)
+            if ru != rv:
+                parent[rv] = ru
+
+        sh, sw = sub_fg.shape[:2]
+        pk_coords = [
+            (
+                int(np.clip(round(float(c[0])), 0, sw - 1)),
+                int(np.clip(round(float(c[1])), 0, sh - 1)),
+            )
+            for c in cents
+        ]
+        heights = [float(dist_s[py, px]) for px, py in pk_coords]
+
+        pairs: list[tuple[float, int, int]] = []
+        for i in range(k_count):
+            for j in range(i + 1, k_count):
+                tau = pinch_ratio * min(heights[i], heights[j])
+                pairs.append((round(tau, 2), i, j))
+        pairs.sort(reverse=True)
+
+        lbl_cache: dict[float, np.ndarray] = {}
+        fg_positive = sub_fg > 0
+        for tau, i, j in pairs:
+            if _find(i) == _find(j):
+                continue
+            lbl = lbl_cache.get(tau)
+            if lbl is None:
+                level_mask = ((dist_s >= tau) & fg_positive).astype(np.uint8)
+                _, lbl = cv2.connectedComponents(level_mask)
+                lbl_cache[tau] = lbl
+            xi, yi = pk_coords[i]
+            xj, yj = pk_coords[j]
+            li = int(lbl[yi, xi])
+            lj = int(lbl[yj, xj])
+            if li > 0 and li == lj:
+                _union(i, j)
+
+        return [_find(i) for i in range(k_count)]
 
     def detect(self, frame_bgr: np.ndarray, conf_thresh: float) -> list[DetectionCandidate]:
         h, w = frame_bgr.shape[:2]
@@ -309,8 +387,26 @@ class CalibratedProposerBackend:
 
         hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
         hh, ss, vv = cv2.split(hsv)
+        vv_f = np.maximum(vv.astype(np.float32), 1.0)
+
+        clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+        vv_eq = clahe.apply(vv)
+        clahe_bgr = cv2.cvtColor(cv2.merge([hh, ss, vv_eq]), cv2.COLOR_HSV2BGR)
+        cb, cg, cr = cv2.split(clahe_bgr.astype(np.float32))
+        clahe_warm = np.clip(cr - 0.5 * cg - 0.5 * cb, 0.0, 255.0)
+        clahe_red_prom = np.clip(0.80 * (cr - cg) + 0.20 * (cr - cb), 0.0, 255.0)
+
+        dark_sat_red = ((hh <= 20) | (hh >= 158)) & (ss >= 90) & (vv >= 18)
+        norm_red_prom = np.where(
+            dark_sat_red,
+            np.clip((red_prom / vv_f) * 180.0, 0.0, 255.0),
+            0.0,
+        ).astype(np.float32)
+        dark_red_prom = np.maximum(clahe_red_prom, norm_red_prom)
+
         warm_hue = ((hh <= 26) | (hh >= 155)) & (ss >= 45) & (vv >= 45) & (rg_diff >= 28.0)
-        fg = ((warm >= 42.0) & warm_hue).astype(np.uint8) * 255
+        dark_red_cue = dark_sat_red & (vv_eq >= 55) & (rg_diff >= 0.35 * vv_f)
+        fg = (((warm >= 42.0) & warm_hue) | dark_red_cue).astype(np.uint8) * 255
 
         k_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
         k_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
@@ -324,6 +420,12 @@ class CalibratedProposerBackend:
         rx = cv2.Sobel(red_prom, cv2.CV_32F, 1, 0, ksize=3)
         ry = cv2.Sobel(red_prom, cv2.CV_32F, 0, 1, ksize=3)
         grad = np.maximum(np.hypot(gx, gy), 0.65 * np.hypot(rx, ry))
+
+        drx = cv2.Sobel(dark_red_prom, cv2.CV_32F, 1, 0, ksize=3)
+        dry = cv2.Sobel(dark_red_prom, cv2.CV_32F, 0, 1, ksize=3)
+        cgx = cv2.Sobel(vv_eq.astype(np.float32), cv2.CV_32F, 1, 0, ksize=3)
+        cgy = cv2.Sobel(vv_eq.astype(np.float32), cv2.CV_32F, 0, 1, ksize=3)
+        dark_grad = np.maximum(np.hypot(cgx, cgy), 0.75 * np.hypot(drx, dry))
 
         raw_boxes: list[tuple[int, int, int, int]] = []
         for cc_id in range(1, num_cc):
@@ -340,20 +442,27 @@ class CalibratedProposerBackend:
             if n_pk <= 2:
                 raw_boxes.append((x0, y0, x0 + cw, y0 + ch))
             else:
-                ys, xs = np.where(sub_fg > 0)
-                pts = np.stack([xs, ys], axis=1)
                 cents = pk_centroids[1:]
-                d2 = ((pts[:, None, :] - cents[None, :, :]) ** 2).sum(axis=2)
-                nearest = np.argmin(d2, axis=1)
-                for k in range(len(cents)):
-                    sel = nearest == k
-                    if int(np.count_nonzero(sel)) < 120:
-                        continue
-                    kxs = pts[sel, 0] + x0
-                    kys = pts[sel, 1] + y0
-                    raw_boxes.append(
-                        (int(kxs.min()), int(kys.min()), int(kxs.max()) + 1, int(kys.max()) + 1)
-                    )
+                roots = self._group_pinched_peaks(sub_fg, dist_s, cents, pinch_ratio=0.78)
+                unique_roots = sorted(set(roots))
+                if len(unique_roots) <= 1:
+                    raw_boxes.append((x0, y0, x0 + cw, y0 + ch))
+                else:
+                    ys, xs = np.where(sub_fg > 0)
+                    pts = np.stack([xs, ys], axis=1)
+                    d2 = ((pts[:, None, :] - cents[None, :, :]) ** 2).sum(axis=2)
+                    nearest = np.argmin(d2, axis=1)
+                    root_arr = np.asarray(roots, dtype=np.int32)
+                    assigned_root = root_arr[nearest]
+                    for grp in unique_roots:
+                        sel = assigned_root == grp
+                        if int(np.count_nonzero(sel)) < 120:
+                            continue
+                        kxs = pts[sel, 0] + x0
+                        kys = pts[sel, 1] + y0
+                        raw_boxes.append(
+                            (int(kxs.min()), int(kys.min()), int(kxs.max()) + 1, int(kys.max()) + 1)
+                        )
 
         candidates: list[DetectionCandidate] = []
         pad = 3
@@ -375,12 +484,37 @@ class CalibratedProposerBackend:
             edge_score = float(np.clip(np.percentile(roi_grad, 93) / 185.0, 0.0, 1.0))
             glare_frac = float(np.mean((roi_v > 230) & (roi_s < 45)))
             fill_frac = float(np.mean(roi_warm > 38.0))
+            fill_score = min(1.0, fill_frac / 0.45)
+
+            roi_v_p85 = float(np.percentile(roi_v, 85))
+            roi_s_p85 = float(np.percentile(roi_s, 85))
+            if roi_v_p85 < 115.0 and roi_s_p85 >= 90.0:
+                dark_weight = float(np.clip((115.0 - roi_v_p85) / 35.0, 0.0, 1.0))
+                roi_dred = dark_red_prom[py1:py2, px1:px2]
+                roi_dgrad = dark_grad[py1:py2, px1:px2]
+                roi_dcue = dark_red_cue[py1:py2, px1:px2]
+                roi_cwarm = clahe_warm[py1:py2, px1:px2]
+
+                d_warm_score = float(np.clip(np.percentile(roi_dred, 85) / 160.0, 0.0, 1.0))
+                d_edge_score = float(np.clip(np.percentile(roi_dgrad, 93) / 185.0, 0.0, 1.0))
+                d_fill_frac = float(np.mean((roi_cwarm > 38.0) | roi_dcue))
+                d_fill_score = min(1.0, d_fill_frac / 0.45)
+
+                warm_score = (1.0 - dark_weight) * warm_score + dark_weight * max(
+                    warm_score, d_warm_score
+                )
+                edge_score = (1.0 - dark_weight) * edge_score + dark_weight * max(
+                    edge_score, d_edge_score
+                )
+                fill_score = (1.0 - dark_weight) * fill_score + dark_weight * max(
+                    fill_score, d_fill_score
+                )
 
             yconf = float(
                 np.clip(
                     0.46 * warm_score
                     + 0.40 * edge_score
-                    + 0.14 * min(1.0, fill_frac / 0.45)
+                    + 0.14 * fill_score
                     - 0.35 * glare_frac,
                     0.0,
                     0.99,

@@ -7,6 +7,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+import pytest
 
 from hybrid_apple_detector import (
     WINDOW_TITLE,
@@ -77,14 +78,31 @@ def test_all_four_modes_and_roi_click_calibration() -> None:
     # Pixels outside active_roi in Mask panel are strictly black (0)
     assert np.count_nonzero(res.hsv_mask[:, 310:]) == 0
 
-    for mode in ("yolo", "hsv", "auto", "hybrid"):
+    for mode in ("yolo", "hybrid"):
         detector.set_mode(mode)
         r = detector.process_frame(bagged)
         assert r.mode == mode
         assert len(r.detections) == 16
 
+    # In hsv and auto modes, active_roi scopes both detection and hsv_mask
+    for mode in ("hsv", "auto"):
+        detector.set_mode(mode)
+        r_roi = detector.process_frame(bagged)
+        assert r_roi.mode == mode
+        assert 1 <= len(r_roi.detections) < 16
+        for det in r_roi.detections:
+            bx1, by1, bx2, by2 = det.bbox
+            assert bx1 >= 90 and by1 >= 55 and bx2 <= 290 and by2 <= 255
+            assert np.count_nonzero(r_roi.hsv_mask[by1:by2, bx1:bx2]) > 0
+
     detector.reset_roi()
     assert detector.active_roi is None
+
+    for mode in ("yolo", "hsv", "auto", "hybrid"):
+        detector.set_mode(mode)
+        r_full = detector.process_frame(bagged)
+        assert r_full.mode == mode
+        assert len(r_full.detections) == 16
 
 
 def test_three_panel_visualizer_and_headless_cli(tmp_path: Path, capsys) -> None:
@@ -160,4 +178,52 @@ def test_three_panel_visualizer_and_headless_cli(tmp_path: Path, capsys) -> None
     vid_payload = json.loads((out_vid / "detections.json").read_text(encoding="utf-8"))
     assert len(vid_payload) == 2
     assert all(item["apple_count"] == 1 for item in vid_payload)
+
+
+def test_oob_click_roi_and_cross_resolution_active_roi() -> None:
+    bagged = load_image(SAMPLES_DIR / "bagged_apples_scene.png")
+    detector = HybridAppleDetector(PipelineConfig(mode="auto"))
+
+    logs_oob = detector.click_roi(bagged, -200, -200)
+    assert logs_oob == ["[ROI CLICK] ignored out-of-bounds"]
+    assert detector.active_roi is None
+    assert detector.profile.sampled_pixels == 0
+
+    logs_rect_oob = detector.select_roi_rect(bagged, (-50, -50, -10, -10))
+    assert logs_rect_oob == ["[ROI CLICK] ignored out-of-bounds"]
+    assert detector.active_roi is None
+    assert detector.profile.sampled_pixels == 0
+
+    # Valid click on 960x720, then process smaller frames in hsv/auto/hybrid modes
+    detector.click_roi(bagged, 800, 600)
+    assert detector.active_roi == (700, 500, 900, 700)
+    small_frame = np.full((200, 200, 3), (18, 20, 205), dtype=np.uint8)
+    for mode in ("hsv", "auto", "hybrid"):
+        detector.set_mode(mode)
+        r_small = detector.process_frame(small_frame)
+        if mode in ("hsv", "auto"):
+            assert len(r_small.detections) == 0
+            assert np.count_nonzero(r_small.hsv_mask) == 0
+
+
+def test_cli_validation_and_clean_error_exits(tmp_path: Path, capsys) -> None:
+    img_path = SAMPLES_DIR / "orchard_scene.png"
+    for bad_args in [
+        ["--source", str(img_path), "--yolo-conf", "nan"],
+        ["--source", str(img_path), "--yolo-conf", "-0.5"],
+        ["--source", str(img_path), "--yolo-conf", "1.5"],
+        ["--source", str(img_path), "--bypass-conf", "2.0"],
+        ["--source", str(img_path), "--roi-click", "abc"],
+    ]:
+        with pytest.raises(SystemExit) as exc_info:
+            cli_main(bad_args)
+        assert exc_info.value.code == 2
+
+    rc_missing = cli_main(["--source", str(tmp_path / "missing.png"), "--output-dir", str(tmp_path / "out1")])
+    assert rc_missing == 1
+    assert "error:" in capsys.readouterr().err
+
+    rc_onnx = cli_main(["--source", str(img_path), "--backend", "onnx", "--output-dir", str(tmp_path / "out2")])
+    assert rc_onnx == 2
+    assert "error:" in capsys.readouterr().err
 

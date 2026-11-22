@@ -60,7 +60,8 @@ class HybridAppleDetector:
             clahe_clip_limit=self.config.clahe_clip_limit,
             clahe_grid_size=self.config.clahe_grid_size,
         )
-        self.active_roi = roi_rect
+        if roi_rect is not None:
+            self.active_roi = roi_rect
         return logs
 
     def select_roi_rect(self, frame_bgr: np.ndarray, rect: tuple[int, int, int, int]) -> list[str]:
@@ -72,8 +73,28 @@ class HybridAppleDetector:
             clahe_clip_limit=self.config.clahe_clip_limit,
             clahe_grid_size=self.config.clahe_grid_size,
         )
-        self.active_roi = roi_rect
+        if roi_rect is not None:
+            self.active_roi = roi_rect
         return logs
+
+    @staticmethod
+    def _clamp_roi(
+        roi: tuple[int, int, int, int] | None,
+        height: int,
+        width: int,
+    ) -> tuple[int, int, int, int] | None:
+        if roi is None:
+            return None
+        raw_x1, raw_y1, raw_x2, raw_y2 = int(roi[0]), int(roi[1]), int(roi[2]), int(roi[3])
+        if raw_x2 <= raw_x1 or raw_y2 <= raw_y1:
+            return None
+        rx1 = max(0, min(width, raw_x1))
+        ry1 = max(0, min(height, raw_y1))
+        rx2 = max(0, min(width, raw_x2))
+        ry2 = max(0, min(height, raw_y2))
+        if rx2 <= rx1 or ry2 <= ry1:
+            return None
+        return (rx1, ry1, rx2, ry2)
 
     def reset_roi(self) -> AdaptiveHSVProfile:
         """Reset active ROI to full frame and restore baseline split-range HSV profile."""
@@ -97,6 +118,8 @@ class HybridAppleDetector:
         """Run the configured pipeline on a single BGR frame and return FrameResult."""
         t0 = time.perf_counter()
         frame = normalize_bgr(frame_bgr)
+        h, w = frame.shape[:2]
+        clamped_roi = self._clamp_roi(self.active_roi, h, w)
         mode = self.config.mode
         logs: list[str] = list(self._pending_logs)
         self._pending_logs.clear()
@@ -146,12 +169,16 @@ class HybridAppleDetector:
         elif mode in ("hsv", "auto"):
             if mode == "auto":
                 logs.extend(self._auto_calibrate_if_needed(frame))
-            refinements, full_mask = detect_in_rect(
-                frame,
-                rect=None,
-                profile=self.calibrator.profile,
-                config=self.config,
-            )
+            if self.active_roi is not None and clamped_roi is None:
+                refinements = []
+                hsv_mask = np.zeros((h, w), dtype=np.uint8)
+            else:
+                refinements, hsv_mask = detect_in_rect(
+                    frame,
+                    rect=clamped_roi,
+                    profile=self.calibrator.profile,
+                    config=self.config,
+                )
             candidates = [r.candidate for r in refinements]
             raw_dets = [
                 HybridDetection(
@@ -171,12 +198,6 @@ class HybridAppleDetector:
                 if r.passed and r.hsv_conf >= self.config.final_conf_thresh
             ]
             detections = nms_hybrid_boxes(raw_dets, iou_threshold=self.config.nms_iou_thresh)
-            if self.active_roi is not None:
-                rx1, ry1, rx2, ry2 = self.active_roi
-                hsv_mask = np.zeros_like(full_mask)
-                hsv_mask[ry1:ry2, rx1:rx2] = full_mask[ry1:ry2, rx1:rx2]
-            else:
-                hsv_mask = full_mask
             tag = "AUTO" if mode == "auto" else "HSV"
             logs.append(f"[{tag}] Apple Count: {len(detections)}")
 
@@ -197,6 +218,6 @@ class HybridAppleDetector:
             fps=fps,
             latency_ms=latency_ms,
             profile=self.calibrator.profile,
-            active_roi=self.active_roi,
+            active_roi=clamped_roi,
             logs=logs,
         )

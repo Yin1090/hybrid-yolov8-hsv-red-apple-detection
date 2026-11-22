@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 import numpy as np
 import pytest
 
@@ -95,3 +97,56 @@ def test_nms_hybrid_boxes_iou_055() -> None:
 
     kept = nms_hybrid_boxes([d_overlap, d_distinct, d_high], iou_threshold=0.55)
     assert [d.score_final for d in kept] == [0.90, 0.75]
+
+
+def test_fuse_score_and_suppress_reject_nan_and_invalid_rois() -> None:
+    with pytest.raises(ValueError):
+        fuse_score(float("nan"), 0.5)
+    with pytest.raises(ValueError):
+        fuse_score(0.5, float("inf"))
+
+    dummy_mask = np.zeros((10, 10), dtype=np.uint8)
+    nan_yconf = RefinementResult(
+        candidate=DetectionCandidate((10, 10, 50, 50), yconf=float("nan")),
+        passed=True,
+        reject_reason=None,
+        red_ratio=0.5,
+        circularity=0.8,
+        solidity=0.9,
+        extent=0.8,
+        aspect_ratio=1.0,
+        hsv_conf=0.8,
+        roi_mask=dummy_mask,
+    )
+    zero_area_strict = RefinementResult(
+        candidate=DetectionCandidate((10, 10, 10, 10), yconf=0.95),
+        passed=False,
+        reject_reason="invalid_roi",
+        red_ratio=0.0,
+        circularity=0.0,
+        solidity=0.0,
+        extent=0.0,
+        aspect_ratio=0.0,
+        hsv_conf=0.0,
+        roi_mask=np.zeros((0, 0), dtype=np.uint8),
+    )
+    valid = RefinementResult(
+        candidate=DetectionCandidate((100, 100, 150, 150), yconf=0.80),
+        passed=True,
+        reject_reason=None,
+        red_ratio=0.5,
+        circularity=0.85,
+        solidity=0.95,
+        extent=0.78,
+        aspect_ratio=1.0,
+        hsv_conf=0.85,
+        roi_mask=dummy_mask,
+    )
+
+    dets = fuse_and_suppress(
+        [nan_yconf, zero_area_strict, valid],
+        PipelineConfig(strict_bypass=True),
+    )
+    assert len(dets) == 1
+    assert dets[0].bbox == (100, 100, 150, 150)
+    assert math.isfinite(dets[0].score_final)

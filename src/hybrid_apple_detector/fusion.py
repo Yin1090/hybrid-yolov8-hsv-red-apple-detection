@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Sequence
 
 import numpy as np
@@ -21,9 +22,25 @@ def fuse_score(
 
     Returns (score_final, bypassed).
     """
-    if yconf > bypass_conf:
-        return float(np.clip(yconf, 0.0, 1.0)), True
-    weighted = yolo_weight * float(yconf) + hsv_weight * float(hsv_conf)
+    yf = float(yconf)
+    hf = float(hsv_conf)
+    bf = float(bypass_conf)
+    yw = float(yolo_weight)
+    hw = float(hsv_weight)
+    if not (
+        math.isfinite(yf)
+        and math.isfinite(hf)
+        and math.isfinite(bf)
+        and math.isfinite(yw)
+        and math.isfinite(hw)
+    ):
+        raise ValueError(
+            f"Non-finite confidence or weight in fuse_score: yconf={yconf!r}, hsv_conf={hsv_conf!r}"
+        )
+
+    if yf > bf:
+        return float(np.clip(yf, 0.0, 1.0)), True
+    weighted = yw * yf + hw * hf
     return float(np.clip(weighted, 0.0, 1.0)), False
 
 
@@ -70,6 +87,20 @@ def fuse_and_suppress(
     accepted: list[HybridDetection] = []
     for ref in refinements:
         cand = ref.candidate
+        bx1, by1, bx2, by2 = cand.bbox
+        if not (
+            math.isfinite(float(bx1))
+            and math.isfinite(float(by1))
+            and math.isfinite(float(bx2))
+            and math.isfinite(float(by2))
+        ):
+            continue
+        if bx2 <= bx1 or by2 <= by1:
+            continue
+        if ref.reject_reason in ("invalid_bbox", "invalid_roi"):
+            continue
+        if not (math.isfinite(float(cand.yconf)) and math.isfinite(float(ref.hsv_conf))):
+            continue
         if not ref.passed:
             if not (config.strict_bypass and cand.yconf > config.bypass_conf):
                 continue
@@ -81,7 +112,7 @@ def fuse_and_suppress(
             yolo_weight=config.yolo_weight,
             hsv_weight=config.hsv_weight,
         )
-        if score_final < config.final_conf_thresh:
+        if not math.isfinite(score_final) or score_final < config.final_conf_thresh:
             continue
 
         accepted.append(

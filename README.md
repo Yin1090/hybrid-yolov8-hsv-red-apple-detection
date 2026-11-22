@@ -89,6 +89,8 @@ python -m pip install -e ".[dev]"
 ```
 
 #### CLI Usage (Headless & Interactive)
+> Note: If you skipped `python -m pip install -e ".[dev]"`, set `PYTHONPATH=src` before invoking `python -m hybrid_apple_detector`.
+
 ```bash
 # Run headless hybrid detection on a single image and save 3-panel output + JSON
 python -m hybrid_apple_detector --source data/samples/dense_crate_scene.png --mode hybrid --yolo-conf 0.65 --output-dir outputs --save-json
@@ -207,6 +209,8 @@ python -m pip install -e ".[dev]"
 ```
 
 #### Chạy qua dòng lệnh (Headless & Tương tác)
+> Lưu ý: Nếu chưa cài gói bằng `python -m pip install -e ".[dev]"`, hãy đặt `PYTHONPATH=src` trước khi chạy `python -m hybrid_apple_detector`.
+
 ```bash
 # Chạy phát hiện Hybrid không giao diện trên một ảnh và lưu kết quả 3 khung + JSON
 python -m hybrid_apple_detector --source data/samples/dense_crate_scene.png --mode hybrid --yolo-conf 0.65 --output-dir outputs --save-json

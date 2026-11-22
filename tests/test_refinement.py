@@ -146,3 +146,43 @@ def test_detect_in_rect_translates_coordinates() -> None:
     assert 170 <= x1 <= 185 and 150 <= y1 <= 165
     assert 235 <= x2 <= 250 and 215 <= y2 <= 230
     assert full_mask.shape == (300, 300)
+
+
+def test_rotation_invariant_aspect_ratio_preserves_axis_boundaries() -> None:
+    # Axis-aligned exact boundaries [0.5, 2.0] preserved
+    for w, h, expected_pass in [(100, 200, True), (200, 100, True), (100, 202, False), (202, 100, False)]:
+        mask = np.full((h, w), 255, dtype=np.uint8)
+        _, _, _, _, ar, has_cnt = compute_geometry_metrics(mask)
+        assert has_cnt
+        assert ((0.5 <= ar <= 2.0) is expected_pass)
+
+    # 45-degree rotated 85x35 (2.43:1) bar rejected via minAreaRect oriented aspect ratio
+    frame = np.full((240, 240, 3), (75, 110, 80), dtype=np.uint8)
+    pts = cv2.boxPoints(((120, 120), (85, 35), 45.0)).astype(np.int32)
+    cv2.fillPoly(frame, [pts], (18, 20, 205))
+    refs, _ = detect_in_rect(frame)
+    assert len(refs) == 0
+
+
+def test_refine_and_calibrator_reject_nan_oob_and_empty_rois() -> None:
+    frame = np.full((128, 128, 3), (18, 20, 205), dtype=np.uint8)
+
+    nan_res = refine_candidate(frame, DetectionCandidate((float("nan"), 10, 50, 50), yconf=0.80))  # type: ignore[arg-type]
+    assert nan_res.passed is False
+    assert nan_res.reject_reason == "invalid_bbox"
+
+    for bad_box in [(-50, -50, -10, -10), (128, 128, 178, 178), (20, 20, 20, 20), (60, 60, 20, 20)]:
+        bad_res = refine_candidate(frame, DetectionCandidate(bad_box, yconf=0.90))
+        assert bad_res.passed is False
+        assert bad_res.reject_reason == "invalid_roi"
+
+    cal = AdaptiveHSVCalibrator()
+    prof_pt, rect_pt, logs_pt = cal.calibrate_from_point(frame, -200, -200)
+    assert rect_pt is None
+    assert prof_pt.sampled_pixels == 0
+    assert logs_pt == ["[ROI CLICK] ignored out-of-bounds"]
+
+    prof_rc, rect_rc, logs_rc = cal.calibrate_from_rect(frame, (-50, -50, -10, -10))
+    assert rect_rc is None
+    assert prof_rc.sampled_pixels == 0
+    assert logs_rc == ["[ROI CLICK] ignored out-of-bounds"]
