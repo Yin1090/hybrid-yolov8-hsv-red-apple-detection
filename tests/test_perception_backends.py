@@ -260,3 +260,11 @@ def test_cluster_splitting_and_thick_c_ribbon_rejection_across_modes() -> None:
     for mode, yc in (("hybrid", 0.15), ("hsv", 0.65), ("auto", 0.65)):
         res_c = HybridAppleDetector(PipelineConfig(mode=mode, yolo_conf=yc)).process_frame(c_ribbon)
         assert len(res_c.detections) == 0, f"C_r70_t40 failed in mode={mode} yc={yc}"
+
+
+def test_decode_yolov8_output_non_ndarray_invalid_rank_raises_value_error() -> None:
+    import pytest
+    from hybrid_apple_detector.perception import decode_yolov8_output
+
+    with pytest.raises(ValueError, match="Expected 2D or 3D YOLOv8 output tensor"):
+        decode_yolov8_output([1.0, 2.0, 3.0], 0.5, 1.0, 0.0, 0.0, (480, 640))

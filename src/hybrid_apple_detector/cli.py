@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import json
 import math
 import sys
@@ -156,13 +157,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-
     roi_pt = args.roi_click
-    if isinstance(roi_pt, str):
-        try:
-            roi_pt = _parse_roi_click(roi_pt)
-        except ValueError as exc:
-            parser.error(str(exc))
 
     try:
         cfg = PipelineConfig(
@@ -184,11 +179,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             cam_or_path: str | int = int(source_str) if source_str.isdigit() else source_str
             with VideoFrameSource(cam_or_path) as cap:
                 if args.show:
-                    frames = list(cap)
                     out_dir.mkdir(parents=True, exist_ok=True)
                     run_interactive_viewer(
                         detector,
-                        [(f"frame_{idx:05d}.png", frm) for idx, frm in frames],
+                        ((f"frame_{idx:05d}.png", frm) for idx, frm in cap),
                         output_dir=out_dir,
                     )
                     return 0
@@ -215,15 +209,26 @@ def main(argv: Sequence[str] | None = None) -> int:
                     output_dir=out_dir,
                 )
                 return 0
+            stem_counts = Counter(p.stem for p, _ in items)
+            first_hw: tuple[int, int] | None = None
             for idx, (img_path, img) in enumerate(items):
-                if idx == 0 and roi_pt is not None:
-                    for line in detector.click_roi(img, roi_pt[0], roi_pt[1]):
-                        print(line)
+                if idx == 0:
+                    first_hw = img.shape[:2]
+                    if roi_pt is not None:
+                        for line in detector.click_roi(img, roi_pt[0], roi_pt[1]):
+                            print(line)
+                elif roi_pt is not None and first_hw is not None and img.shape[:2] != first_hw:
+                    detector.active_roi = None
                 res = detector.process_frame(img)
                 for line in res.logs:
                     print(line)
                 panel = render_three_panel(img, res)
-                save_image(out_dir / f"{img_path.stem}_result.png", panel)
+                out_stem = (
+                    f"{img_path.stem}_{img_path.suffix.lstrip('.')}"
+                    if stem_counts[img_path.stem] > 1 and img_path.suffix
+                    else img_path.stem
+                )
+                save_image(out_dir / f"{out_stem}_result.png", panel)
                 all_summaries.append(_result_to_dict(img_path.name, res))
         else:
             img = load_image(source_path)

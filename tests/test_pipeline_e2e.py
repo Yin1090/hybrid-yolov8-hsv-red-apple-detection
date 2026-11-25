@@ -636,5 +636,41 @@ def test_e2e_iteration7_power_voronoi_ellip_rings_thickc_kidney_and_glare() -> N
             )
 
 
+def test_cli_batch_same_stem_collision_and_lazy_video_viewer(tmp_path: Path, monkeypatch) -> None:
+    import cv2
+    from hybrid_apple_detector.cli import main as cli_main
+    from hybrid_apple_detector.visualizer import run_interactive_viewer
+
+    in_dir = tmp_path / "mixed"
+    out_dir = tmp_path / "out"
+    in_dir.mkdir()
+    sample = np.full((240, 320, 3), (75, 110, 80), dtype=np.uint8)
+    cv2.imwrite(str(in_dir / "apple.png"), sample)
+    cv2.imwrite(str(in_dir / "apple.jpg"), sample)
+
+    assert cli_main(["--source", str(in_dir), "--output-dir", str(out_dir)]) == 0
+    assert (out_dir / "apple_png_result.png").is_file()
+    assert (out_dir / "apple_jpg_result.png").is_file()
+
+    # Lazy generator viewer should only consume 1 frame before 'q' quit (never list(frames))
+    consumed = 0
+
+    def _lazy_gen():
+        nonlocal consumed
+        for i in range(10):
+            consumed += 1
+            yield (f"f_{i}.png", sample)
+
+    monkeypatch.setattr(cv2, "namedWindow", lambda *a, **k: None)
+    monkeypatch.setattr(cv2, "setMouseCallback", lambda *a, **k: None)
+    monkeypatch.setattr(cv2, "imshow", lambda *a, **k: None)
+    monkeypatch.setattr(cv2, "destroyAllWindows", lambda: None)
+    monkeypatch.setattr(cv2, "waitKey", lambda _d=0: ord("q"))
+
+    det = HybridAppleDetector(PipelineConfig(mode="hsv"))
+    run_interactive_viewer(det, _lazy_gen(), output_dir=out_dir)
+    assert consumed == 1
+
+
 
 

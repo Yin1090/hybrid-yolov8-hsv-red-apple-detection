@@ -34,6 +34,8 @@ def preprocess_roi_hsv(
     clahe_grid_size: tuple[int, int] = (8, 8),
 ) -> np.ndarray:
     """Apply 5x5 Gaussian blur, BGR->HSV conversion, and CLAHE strictly on the V channel."""
+    if gaussian_ksize <= 0:
+        raise ValueError(f"gaussian_ksize must be positive, got {gaussian_ksize}")
     k = gaussian_ksize if gaussian_ksize % 2 == 1 else gaussian_ksize + 1
     blurred = cv2.GaussianBlur(roi_bgr, (k, k), 0)
     hsv = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
@@ -65,6 +67,8 @@ def build_split_red_mask(
     if mk >= 3:
         mask = cv2.medianBlur(mask, mk)
 
+    if morph_ksize <= 0:
+        raise ValueError(f"morph_ksize must be positive, got {morph_ksize}")
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (morph_ksize, morph_ksize))
     if open_iter > 0:
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=open_iter)
@@ -907,6 +911,10 @@ class AdaptiveHSVCalibrator:
         added_count = int(samples.shape[0])
         self._accumulated_hsv.append(samples)
         all_samples = np.vstack(self._accumulated_hsv)
+        max_history = 50_000
+        if all_samples.shape[0] > max_history:
+            all_samples = all_samples[-max_history:]
+            self._accumulated_hsv = [all_samples]
 
         h_vals = all_samples[:, 0]
         s_vals = all_samples[:, 1]

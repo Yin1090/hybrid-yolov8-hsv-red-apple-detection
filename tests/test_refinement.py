@@ -591,4 +591,16 @@ def test_iteration7_power_voronoi_glare_halo_and_void_regression() -> None:
     assert len(refs_5p) == 5
 
 
+def test_preprocess_and_mask_reject_non_positive_kernel_sizes() -> None:
+    import pytest
+    from hybrid_apple_detector.config import AdaptiveHSVProfile
+    from hybrid_apple_detector.refinement import build_split_red_mask, preprocess_roi_hsv
+
+    img = np.zeros((32, 32, 3), dtype=np.uint8)
+    with pytest.raises(ValueError, match="gaussian_ksize must be positive"):
+        preprocess_roi_hsv(img, gaussian_ksize=0)
+    with pytest.raises(ValueError, match="morph_ksize must be positive"):
+        build_split_red_mask(img, AdaptiveHSVProfile(), morph_ksize=0)
+
+
 

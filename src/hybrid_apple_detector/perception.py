@@ -101,7 +101,7 @@ def decode_yolov8_output(
     if arr.ndim == 3:
         arr = arr[0]
     if arr.ndim != 2:
-        raise ValueError(f"Expected 2D or 3D YOLOv8 output tensor, got shape {output_tensor.shape}")
+        raise ValueError(f"Expected 2D or 3D YOLOv8 output tensor, got shape {arr.shape}")
 
     # Normalize layout to (N_preds, 4 + C)
     if channels_first is True:

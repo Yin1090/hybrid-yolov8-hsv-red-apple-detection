@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Iterable
 
@@ -114,50 +115,85 @@ def run_interactive_viewer(
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    frame_list = list(frames)
-    if not frame_list:
-        return
+    is_seq = isinstance(frames, Sequence)
+    if is_seq:
+        if not frames:
+            return
+        frame_seq = frames
+        iterator = None
+        current_pair: tuple[str, np.ndarray] = frame_seq[0]
+    else:
+        frame_seq = None
+        iterator = iter(frames)
+        try:
+            current_pair = next(iterator)
+        except StopIteration:
+            return
 
-    state: dict[str, int] = {"idx": 0}
+    state: dict[str, object] = {
+        "idx": 0,
+        "current": current_pair,
+        "dirty": True,
+    }
 
     def _on_mouse(event: int, x: int, y: int, _flags: int, _param: object) -> None:
         if event == cv2.EVENT_LBUTTONDOWN:
-            _, current = frame_list[state["idx"]]
+            _, current = state["current"]  # type: ignore[misc]
             w = current.shape[1]
             local_x = x % w
             logs = detector.click_roi(current, local_x, y)
             for line in logs:
                 print(line)
+            state["dirty"] = True
 
     cv2.namedWindow(WINDOW_TITLE, cv2.WINDOW_NORMAL)
     cv2.setMouseCallback(WINDOW_TITLE, _on_mouse)
 
+    last_canvas: np.ndarray | None = None
     try:
         while True:
-            name, frame = frame_list[state["idx"]]
-            result = detector.process_frame(frame)
-            canvas = render_three_panel(frame, result)
-            cv2.imshow(WINDOW_TITLE, canvas)
+            is_single_static = frame_seq is not None and len(frame_seq) == 1
+            if not is_single_static or state["dirty"] or last_canvas is None:
+                name, frame = state["current"]  # type: ignore[misc]
+                result = detector.process_frame(frame)
+                last_canvas = render_three_panel(frame, result)
+                cv2.imshow(WINDOW_TITLE, last_canvas)
+                state["dirty"] = False
+            else:
+                name, _ = state["current"]  # type: ignore[misc]
 
-            delay = 0 if len(frame_list) == 1 else 30
-            key = cv2.waitKey(delay) & 0xFF
+            key = cv2.waitKey(30) & 0xFF
             if key in (ord("q"), ord("Q"), 27):
                 break
             elif key in (ord("y"), ord("Y")):
                 detector.set_mode("yolo")
+                state["dirty"] = True
             elif key in (ord("h"), ord("H")):
                 detector.set_mode("auto")
+                state["dirty"] = True
             elif key in (ord("c"), ord("C")):
                 detector.set_mode("hsv")
+                state["dirty"] = True
             elif key in (ord("a"), ord("A")):
                 detector.set_mode("hybrid")
+                state["dirty"] = True
             elif key in (ord("r"), ord("R")):
                 detector.reset_roi()
+                state["dirty"] = True
             elif key in (ord("s"), ord("S")):
-                save_path = out_dir / f"{Path(name).stem}_snapshot.png"
-                save_image(save_path, canvas)
+                save_path = out_dir / f"{Path(str(name)).stem}_snapshot.png"
+                save_image(save_path, last_canvas)
                 print(f"[SAVED] {save_path}")
-            elif len(frame_list) > 1:
-                state["idx"] = (state["idx"] + 1) % len(frame_list)
+            elif frame_seq is not None and len(frame_seq) > 1:
+                next_idx = (int(state["idx"]) + 1) % len(frame_seq)
+                state["idx"] = next_idx
+                state["current"] = frame_seq[next_idx]
+                state["dirty"] = True
+            elif iterator is not None:
+                try:
+                    state["current"] = next(iterator)
+                    state["dirty"] = True
+                except StopIteration:
+                    break
     finally:
         cv2.destroyAllWindows()

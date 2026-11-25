@@ -89,7 +89,7 @@ python -m pip install -e ".[dev]"
 ```
 
 #### CLI Usage (Headless & Interactive)
-> Note: If you skipped `python -m pip install -e ".[dev]"`, set `PYTHONPATH=src` before invoking `python -m hybrid_apple_detector`.
+> Note: If you skipped `python -m pip install -e ".[dev]"`, set `PYTHONPATH=src` (bash) or `$env:PYTHONPATH="src"` (Windows PowerShell) before invoking `python -m hybrid_apple_detector`.
 
 ```bash
 # Run headless hybrid detection on a single image and save 3-panel output + JSON
@@ -209,7 +209,7 @@ python -m pip install -e ".[dev]"
 ```
 
 #### Chạy qua dòng lệnh (Headless & Tương tác)
-> Lưu ý: Nếu chưa cài gói bằng `python -m pip install -e ".[dev]"`, hãy đặt `PYTHONPATH=src` trước khi chạy `python -m hybrid_apple_detector`.
+> Lưu ý: Nếu chưa cài gói bằng `python -m pip install -e ".[dev]"`, hãy đặt `PYTHONPATH=src` (bash) hoặc `$env:PYTHONPATH="src"` (Windows PowerShell) trước khi chạy `python -m hybrid_apple_detector`.
 
 ```bash
 # Chạy phát hiện Hybrid không giao diện trên một ảnh và lưu kết quả 3 khung + JSON
